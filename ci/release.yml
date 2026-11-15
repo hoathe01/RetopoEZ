@@ -1,0 +1,26 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, bin: retopoez.exe, asset: retopoez-windows-x64.exe }
+          - { os: macos-latest,   bin: retopoez,     asset: retopoez-macos-arm64 }
+          - { os: ubuntu-latest,  bin: retopoez,     asset: retopoez-linux-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --locked
+        working-directory: rust
+      - run: cp rust/target/release/${{ matrix.bin }} ${{ matrix.asset }}
+        shell: bash
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.asset }}
