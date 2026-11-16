@@ -61,3 +61,5 @@ Lần sau mở viewer không kèm file, nó mở lại file lần trước. Expo
 ## Phím tắt chính
 Space (giữ) = menu radial · Tab (bấm) = bật/tắt Edit, Tab (giữ) = Edit tạm thời · B hoặc 1 = Brush (R relax, V grab, [ ] đổi cỡ, Ctrl+chuột phải kéo = cỡ/độ cứng) · Shift+kéo = đường thẳng · G grid · A auto · L live · M mirror · E export · Ctrl+Z.
 Edit: giữ Tab, giữ chuột rồi di qua các mặt để chọn chúng; thả Tab về pencil. Click một mặt để chọn/bỏ chọn, click chỗ trống bỏ hết, Esc bỏ hết.
+
+Vẽ lại lưới: chọn face (Tab), rồi vẽ nét lên vùng đó. Viền vùng chọn giữ nguyên, nét mới chia lại lưới bên trong; vùng 3 đến 8 cạnh được lấp bằng quad quanh một điểm giữa. Enter giữ kết quả, Ctrl+Z lùi từng nét, Esc huỷ về lưới cũ.

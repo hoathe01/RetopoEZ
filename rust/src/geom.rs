@@ -360,6 +360,7 @@ pub fn four_grid(ends: &[(Vec3, Vec3)], sampler: impl Fn(usize, usize) -> Vec<Ve
     coons(&trav(0, u), &trav(1, v), &rev(trav(2, u)), &rev(trav(3, v)))
 }
 
+#[derive(Clone)]
 pub struct Patch {
     pub nu: usize,
     pub nv: usize,
@@ -683,6 +684,7 @@ pub fn auto_patches(m: &Mesh, strokes: &[&[Vec3]], tol: f32, target: f32) -> Aut
     // 6. trace faces (face on the left); keep CCW 4-cycles
     let mut seen = vec![false; edges.len() * 2];
     let mut quads: Vec<[usize; 4]> = Vec::new();
+    let mut ngons: Vec<(Vec<Vec3>, Vec<Vec3>)> = Vec::new(); // 3..8-sided regions: corners + edge midpoints
     let mut skipped = 0;
     for h0 in 0..edges.len() * 2 {
         if !alive[h0 / 2] || seen[h0] {
@@ -709,6 +711,8 @@ pub fn auto_patches(m: &Mesh, strokes: &[&[Vec3]], tol: f32, target: f32) -> Aut
         }
         if face.len() == 4 {
             quads.push([face[0], face[1], face[2], face[3]]);
+        } else if (3..=8).contains(&face.len()) {
+            ngons.push((pts, face.iter().map(|&h| sample(&oriented(h), 2)[1]).collect::<Vec<_>>()));
         } else {
             skipped += 1;
         }
@@ -740,7 +744,68 @@ pub fn auto_patches(m: &Mesh, strokes: &[&[Vec3]], tol: f32, target: f32) -> Aut
         s3.reverse();
         patches.push(snap(m, &coons(&s0, &s1, &s2, &s3)));
     }
+    for (c, mids) in &ngons {
+        patches.extend(fill_ngon(m, c, mids, target));
+    }
     Auto { patches, skipped }
+}
+
+/// A k-sided region becomes k quads around a centre point (corner, next edge midpoint, centre, previous midpoint).
+fn fill_ngon(m: &Mesh, corners: &[Vec3], mids: &[Vec3], target: f32) -> Vec<Patch> {
+    let k = corners.len();
+    let centre = closest(m, corners.iter().sum::<Vec3>() / k as f32).0;
+    let half = corners.iter().zip(mids).map(|(a, b)| a.distance(*b)).sum::<f32>() / k as f32;
+    let n = ((half / target).round() as usize).clamp(1, 64);
+    let line = |p: Vec3, q: Vec3| (0..=n).map(|t| p.lerp(q, t as f32 / n as f32)).collect::<Vec<_>>();
+    (0..k)
+        .map(|i| {
+            let (a, b, d) = (corners[i], mids[i], mids[(i + k - 1) % k]);
+            snap(m, &coons(&line(a, b), &line(b, centre), &line(d, centre), &line(a, d)))
+        })
+        .collect()
+}
+
+/// Outline of a set of quads: edges used by exactly one quad, chained into polylines (closed ones repeat their first point).
+pub fn region_loops(cells: &[[Vec3; 4]], tol: f32) -> Vec<Vec<Vec3>> {
+    let key = |p: Vec3| ((p.x / tol).round() as i64, (p.y / tol).round() as i64, (p.z / tol).round() as i64);
+    let mut count: HashMap<((i64, i64, i64), (i64, i64, i64)), (u32, Vec3, Vec3)> = HashMap::new();
+    for c in cells {
+        for k in 0..4 {
+            let (a, b) = (c[k], c[(k + 1) % 4]);
+            let (ka, kb) = (key(a), key(b));
+            if ka == kb {
+                continue;
+            }
+            let e = count.entry(if ka < kb { (ka, kb) } else { (kb, ka) }).or_insert((0, a, b));
+            e.0 += 1;
+        }
+    }
+    let mut adj: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    let edges: Vec<(Vec3, Vec3)> = count.values().filter(|e| e.0 == 1).map(|e| (e.1, e.2)).collect();
+    for (i, (a, b)) in edges.iter().enumerate() {
+        adj.entry(key(*a)).or_default().push(i);
+        adj.entry(key(*b)).or_default().push(i);
+    }
+    let mut used = vec![false; edges.len()];
+    let mut out = vec![];
+    for s in 0..edges.len() {
+        if used[s] {
+            continue;
+        }
+        used[s] = true;
+        let mut chain = vec![edges[s].0, edges[s].1];
+        // grow at the tail, then at the head
+        for _ in 0..2 {
+            while let Some(&e) = adj.get(&key(*chain.last().unwrap())).and_then(|l| l.iter().find(|&&e| !used[e])) {
+                used[e] = true;
+                let (a, b) = edges[e];
+                chain.push(if key(a) == key(*chain.last().unwrap()) { b } else { a });
+            }
+            chain.reverse();
+        }
+        out.push(chain);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1348,6 +1413,18 @@ mod brush_tests {
         assert!(ps[0].pts[4].distance(Vec3::new(-1., 1., 0.)) < 0.01, "{}", ps[0].pts[4]);
         assert_eq!(ps[0].pts[0], Vec3::new(-2., 0., 0.)); // rim pinned
         assert_eq!(ps[0].pts[2], ps[1].pts[0]); // seam still welded
+    }
+
+    #[test]
+    fn region_loop_of_two_quads_is_one_closed_outline_and_ngon_fill_makes_k_quads() {
+        let q = |x: f32| [Vec3::new(x, 0., 0.), Vec3::new(x + 1., 0., 0.), Vec3::new(x + 1., 1., 0.), Vec3::new(x, 1., 0.)];
+        let loops = region_loops(&[q(0.), q(1.)], 1e-4);
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].len(), 7); // 6 corners, closed
+        let m = flat();
+        let c: Vec<Vec3> = (0..5).map(|i| { let a = i as f32 * 1.2566; Vec3::new(a.cos(), a.sin() + 1., 0.) }).collect();
+        let mids: Vec<Vec3> = (0..5).map(|i| (c[i] + c[(i + 1) % 5]) * 0.5).collect();
+        assert_eq!(fill_ngon(&m, &c, &mids, 0.5).len(), 5);
     }
 
     #[test]

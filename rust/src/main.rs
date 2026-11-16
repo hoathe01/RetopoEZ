@@ -50,6 +50,14 @@ const PIE: [&str; 8] = ["PENCIL", "BRUSH", "GRID", "LIVE", "MIRROR", "EXPORT", "
 
 const LOW_DEFAULT: [f32; 3] = [0.03, 0.14, 0.42]; // deep sea blue
 
+/// Drawing over selected faces: the region's outline plus the new strokes are re-quadded, the rest stays.
+struct Reflow {
+    orig: Vec<Patch>, // patches before the first stroke (cancel / undo back to it)
+    base: Vec<Patch>, // everything outside the region (cells of touched patches split into 1x1)
+    bnd: Vec<Vec<Vec3>>,
+    strokes: Vec<Vec<Vec3>>,
+}
+
 struct App {
     path: String,
     status: String,
@@ -91,6 +99,7 @@ struct App {
     faces: Vec<[Vec3; 4]>,                  // every quad of every patch, rebuilt when the patches change
     faces_key: (usize, usize, u32),
     bk: BrushKind,
+    reflow: Option<Reflow>,
     brush_hard: f32,
     grab: Option<(Vec<f32>, Vec<f32>, f32)>, // Grab brush: weights, mirrored weights, world units per pixel
     tab_prev: Tool,
@@ -223,6 +232,7 @@ impl App {
             faces: vec![],
             faces_key: (usize::MAX, 0, 0),
             bk: BrushKind::Relax,
+            reflow: None,
             brush_hard: 0.3,
             grab: None,
             tab_prev: Tool::Draw,
@@ -460,6 +470,9 @@ impl App {
     }
 
     fn push_stroke(&mut self, pts: Vec<Vec3>, live_twin: Option<Vec<Vec3>>) {
+        if self.reflow.is_some() || !self.fsel.is_empty() {
+            return self.reflow_stroke(pts);
+        }
         self.dirty_auto = true;
         let id = self.next_id;
         self.next_id += 2;
@@ -499,6 +512,95 @@ impl App {
         self.auto_note = format!("live: {} cells, {} skipped, {} ms", r.patches.len(), r.skipped, t.elapsed().as_millis());
         self.live_patches = r.patches;
         self.patch_rev += 1;
+    }
+
+    /// A stroke drawn while faces are selected (or a region is open): re-quad the region around it.
+    fn reflow_stroke(&mut self, mut pts: Vec<Vec3>) {
+        if self.reflow.is_none() {
+            if self.live {
+                self.auto(); // freeze live patches so the face indices are patch cells
+            }
+            self.ensure_faces();
+            let orig = self.patches.clone();
+            let (mut base, mut cells, mut idx) = (vec![], vec![], 0usize);
+            for pa in &orig {
+                let (w, n) = (pa.nu + 1, pa.nu * pa.nv);
+                if !(0..n).any(|c| self.fsel.contains(&(idx + c))) {
+                    base.push(pa.clone());
+                } else {
+                    for j in 0..pa.nv {
+                        for i in 0..pa.nu {
+                            let k = j * w + i;
+                            let q = [k, k + 1, k + w, k + w + 1];
+                            if self.fsel.contains(&(idx + j * pa.nu + i)) {
+                                cells.push([pa.pts[k], pa.pts[k + 1], pa.pts[k + w + 1], pa.pts[k + w]]);
+                            } else {
+                                base.push(Patch { nu: 1, nv: 1, pts: q.map(|x| pa.pts[x]).to_vec(), nrm: q.map(|x| pa.nrm[x]).to_vec() });
+                            }
+                        }
+                    }
+                }
+                idx += n;
+            }
+            let tol = self.mesh.as_ref().map_or(1e-4, |m| m.diag * 1e-4);
+            let bnd = geom::region_loops(&cells, tol);
+            if bnd.is_empty() {
+                self.status = "reflow: select faces that touch each other first".into();
+                return;
+            }
+            self.reflow = Some(Reflow { orig, base, bnd, strokes: vec![] });
+            self.fsel.clear();
+        }
+        // ends snap onto the region outline (and onto earlier strokes of this region)
+        if let Some(r) = &self.reflow {
+            let others: Vec<&[Vec3]> = r.bnd.iter().chain(&r.strokes).map(|s| s.as_slice()).collect();
+            if !geom::is_closed(&pts) {
+                if let Some(q) = geom::nearest_on_strokes(*pts.last().unwrap(), &others, self.snap_r) {
+                    pts.push(q);
+                }
+                if let Some(q) = geom::nearest_on_strokes(pts[0], &others, self.snap_r) {
+                    pts.insert(0, q);
+                }
+            }
+        }
+        let twin = match (&self.mesh, self.sym) {
+            (Some(m), true) => Some(pts.iter().map(|&p| geom::mirror_on_surface(m, p, self.axis, self.plane, m.diag * 2e-4)).collect::<Vec<_>>()),
+            _ => None,
+        };
+        if let Some(r) = &mut self.reflow {
+            r.strokes.push(pts);
+            r.strokes.extend(twin);
+        }
+        self.run_reflow();
+    }
+
+    fn run_reflow(&mut self) {
+        let (Some(r), Some(m)) = (&self.reflow, &self.mesh) else { return };
+        let all: Vec<&[Vec3]> = r.bnd.iter().chain(&r.strokes).map(|s| s.as_slice()).collect();
+        let res = geom::auto_patches(m, &all, m.diag * self.snap * 1e-3, m.diag * self.edge * 0.01);
+        self.status = format!("reflow: {} cells, {} regions skipped · Enter keeps it, Ctrl+Z steps back, Esc cancels", res.patches.len(), res.skipped);
+        self.patches = r.base.iter().cloned().chain(res.patches).collect();
+        self.patch_log.clear();
+        self.patch_rev += 1;
+        self.fsel.clear();
+    }
+
+    /// Ctrl+Z / Esc inside a region: drop the last stroke, or restore the original faces.
+    fn reflow_back(&mut self, all: bool) -> bool {
+        let Some(r) = &mut self.reflow else { return false };
+        if !all {
+            r.strokes.pop();
+            if !r.strokes.is_empty() {
+                self.run_reflow();
+                return true;
+            }
+        }
+        if let Some(r) = self.reflow.take() {
+            self.patches = r.orig;
+            self.patch_rev += 1;
+            self.status = "reflow cancelled".into();
+        }
+        true
     }
 
     /// Stroke ends within 16 px of another stroke jump onto it, so nets close without exact aim.
@@ -655,7 +757,7 @@ impl eframe::App for App {
             if key(egui::Key::Delete) {
                 self.delete_selected();
             }
-            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) && !(self.tool == Tool::Brush && self.undo_relax()) && !self.strokes.is_empty() {
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) && !self.reflow_back(false) && !(self.tool == Tool::Brush && self.undo_relax()) && !self.strokes.is_empty() {
                 self.undo_stroke();
             }
         }
@@ -1346,6 +1448,7 @@ impl App {
             self.fsel.clear();
         }
         if self.tool == Tool::Edit && !busy && !alt && resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down()) {
+            self.reflow = None; // choosing new faces keeps the previous region as it is
             let erase = ui.input(|i| i.modifiers.command);
             match resp.interact_pointer_pos().and_then(|p| self.pick_face(vp, rect, p, eye)) {
                 Some(i) => {
@@ -1364,7 +1467,10 @@ impl App {
             }
             ui.ctx().request_repaint();
         }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.reflow = None; // keep the new layout
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !self.reflow_back(true) {
             self.fsel.clear();
         }
 
@@ -1377,6 +1483,10 @@ impl App {
             None
         };
         let mut dsegs: Vec<Seg> = self.cur.windows(2).map(|w| Seg::new(w[0], w[1], [1.0, 0.45, 0.0], 2.2)).collect();
+        if let Some(r) = &self.reflow {
+            dsegs.extend(r.strokes.iter().flat_map(|s| s.windows(2).map(|w| Seg::new(w[0], w[1], [1.0, 0.45, 0.0], 2.2))));
+            dsegs.extend(r.bnd.iter().flat_map(|s| s.windows(2).map(|w| Seg::new(w[0], w[1], [1.0, 0.82, 0.25], 2.0))));
+        }
         dsegs.extend(self.cur_m.windows(2).map(|w| Seg::new(w[0], w[1], [1.0, 0.6, 0.2], 2.2)));
         let gold = [1.0, 0.82, 0.25];
         let ssegs: Vec<Seg> = self
