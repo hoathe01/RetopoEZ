@@ -82,7 +82,6 @@ struct App {
     beauty: f32,             // stroke clean-up strength, 0 = off
     fsel: Vec<(u32, u32)>,   // Edit tool: selected faces (patch, cell)
     fsel_n: usize,           // patch count the selection belongs to
-    marq: Option<(egui::Pos2, egui::Pos2)>, // Edit tool: box selection
     tab_prev: Tool,
     tab_t: Option<std::time::Instant>,
     brush: Option<geom::Weld>, // welded view of the patches while a relax stroke is in progress
@@ -210,7 +209,6 @@ impl App {
             beauty: 0.6,
             fsel: vec![],
             fsel_n: 0,
-            marq: None,
             tab_prev: Tool::Draw,
             tab_t: None,
             brush: None,
@@ -1290,20 +1288,19 @@ impl App {
             }
         }
 
-        // Edit tool: click a face, Shift/Ctrl+click to add or remove, drag a box to select several
+        // Edit tool: click toggles a face; press and drag paints every face the cursor passes over
         let npatch = self.patches.len() + self.live_patches.len();
         if npatch != self.fsel_n {
             self.fsel_n = npatch;
             self.fsel.clear();
         }
-        if self.tool != Tool::Edit {
-            self.marq = None;
-        } else if !busy && !alt {
+        if self.tool == Tool::Edit && !busy && !alt {
+            let dragging = resp.dragged_by(egui::PointerButton::Primary);
             let scr = |q: Vec3| {
                 let c = vp * q.extend(1.0);
                 egui::pos2(rect.min.x + (c.x / c.w * 0.5 + 0.5) * rect.width(), rect.min.y + (0.5 - c.y / c.w * 0.5) * rect.height())
             };
-            let faces = if resp.clicked_by(egui::PointerButton::Primary) { self.all_faces() } else { vec![] };
+            let faces = if dragging || resp.clicked_by(egui::PointerButton::Primary) { self.all_faces() } else { vec![] };
             let visible = |c: Vec3| match &self.mesh {
                 Some(m) if faces.len() < 30000 => {
                     let d = c - eye;
@@ -1313,7 +1310,7 @@ impl App {
                 _ => true,
             };
             let mut picked: Option<Vec<(u32, u32)>> = None;
-            if resp.clicked_by(egui::PointerButton::Primary) {
+            if dragging || resp.clicked_by(egui::PointerButton::Primary) {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let inside = |q: [egui::Pos2; 4]| {
                         let tri = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
@@ -1334,14 +1331,15 @@ impl App {
                 }
             }
             if let Some(ks) = picked {
-                if ks.is_empty() {
+                if ks.is_empty() && !dragging {
                     self.fsel.clear(); // click on nothing
                 }
                 for k in ks {
                     match self.fsel.iter().position(|x| *x == k) {
-                        Some(i) => {
+                        Some(i) if !dragging => {
                             self.fsel.remove(i); // click again to deselect
                         }
+                        Some(_) => {}
                         None => self.fsel.push(k),
                     }
                 }
@@ -1386,11 +1384,6 @@ impl App {
                 p.circle_stroke(h, self.brush_px, egui::Stroke::new(1.5, theme::LAMP));
                 p.circle_stroke(h, self.brush_px * (1.0 - self.brush_strength), egui::Stroke::new(1.0, theme::LAMP.gamma_multiply(0.45)));
             }
-        }
-        if let Some((a, b)) = self.marq {
-            let r = egui::Rect::from_two_pos(a, b);
-            p.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(255, 210, 70, 28));
-            p.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 210, 70)), egui::StrokeKind::Inside);
         }
         let chip = |pos: egui::Pos2, align: egui::Align2, t: &str, col: egui::Color32| {
             let g = p.layout_no_wrap(t.to_string(), theme::typew(12.0), col);
