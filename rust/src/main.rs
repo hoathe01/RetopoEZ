@@ -1299,12 +1299,11 @@ impl App {
         if self.tool != Tool::Edit {
             self.marq = None;
         } else if !busy && !alt {
-            let add = ui.input(|i| i.modifiers.shift || i.modifiers.command);
             let scr = |q: Vec3| {
                 let c = vp * q.extend(1.0);
                 egui::pos2(rect.min.x + (c.x / c.w * 0.5 + 0.5) * rect.width(), rect.min.y + (0.5 - c.y / c.w * 0.5) * rect.height())
             };
-            let faces = if resp.dragged_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary) || self.marq.is_some() { self.all_faces() } else { vec![] };
+            let faces = if resp.clicked_by(egui::PointerButton::Primary) { self.all_faces() } else { vec![] };
             let visible = |c: Vec3| match &self.mesh {
                 Some(m) if faces.len() < 30000 => {
                     let d = c - eye;
@@ -1314,16 +1313,6 @@ impl App {
                 _ => true,
             };
             let mut picked: Option<Vec<(u32, u32)>> = None;
-            if resp.dragged_by(egui::PointerButton::Primary) {
-                if let (Some(o), Some(p)) = (ui.input(|i| i.pointer.press_origin()), resp.interact_pointer_pos()) {
-                    self.marq = Some((o, p));
-                }
-            } else if let Some((a, b)) = self.marq.take() {
-                let r = egui::Rect::from_two_pos(a, b);
-                if r.width() > 4.0 || r.height() > 4.0 {
-                    picked = Some(faces.iter().filter(|(_, c)| r.contains(scr((c[0] + c[1] + c[2] + c[3]) * 0.25)) && visible((c[0] + c[1] + c[2] + c[3]) * 0.25)).map(|(k, _)| *k).collect());
-                }
-            }
             if resp.clicked_by(egui::PointerButton::Primary) {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let inside = |q: [egui::Pos2; 4]| {
@@ -1345,15 +1334,14 @@ impl App {
                 }
             }
             if let Some(ks) = picked {
-                if !add {
-                    self.fsel.clear();
+                if ks.is_empty() {
+                    self.fsel.clear(); // click on nothing
                 }
                 for k in ks {
                     match self.fsel.iter().position(|x| *x == k) {
-                        Some(i) if add => {
-                            self.fsel.remove(i);
+                        Some(i) => {
+                            self.fsel.remove(i); // click again to deselect
                         }
-                        Some(_) => {}
                         None => self.fsel.push(k),
                     }
                 }
