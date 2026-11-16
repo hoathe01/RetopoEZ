@@ -214,7 +214,7 @@ impl App {
             smart: true,
             low: LOW_DEFAULT,
             tab: Tab::Strokes,
-            book: true,
+            book: false, // viewport only; P opens the toolbar and panel
             tool: Tool::Draw,
             pie: None,
             beauty: 0.6,
@@ -660,10 +660,8 @@ impl eframe::App for App {
             }
         }
 
-        self.header(ui);
-        self.footer(ui);
-        self.rail(ui);
         if self.book {
+            self.rail(ui);
             self.book(ui);
         }
         self.viewport(ui);
@@ -932,44 +930,6 @@ impl App {
             4 => self.grid(true),
             n => self.status = format!("click 2 or 4 strokes first (selected: {n})"),
         }
-    }
-
-    fn header(&mut self, ui: &mut egui::Ui) {
-        let name = PathBuf::from(&self.path).file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
-        egui::Panel::top("hdr")
-            .frame(egui::Frame::new().fill(theme::NOIR).stroke(egui::Stroke::new(1.0, theme::LINE)).inner_margin(egui::Margin::symmetric(14, 6)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    theme::label(ui, "RetopoEZ", egui::FontId::proportional(15.0), theme::TITLE);
-                    ui.add_space(10.0);
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().circle_filled(r.center(), 3.5, if self.mesh.is_some() { theme::GREEN } else { theme::LAMP });
-                    theme::label(ui, if name.is_empty() { "no file".to_string() } else { name }, theme::typew(12.0), theme::MUTED);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::button(ui, if self.book { "Hide panel  P" } else { "Panel  P" }, theme::Kind::GhostDark, egui::vec2(96.0, 24.0)).clicked() {
-                            self.book = !self.book;
-                        }
-                    });
-                });
-            });
-    }
-
-    fn footer(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("ftr")
-            .frame(egui::Frame::new().fill(theme::NOIR).stroke(egui::Stroke::new(1.0, theme::LINE)).inner_margin(egui::Margin::symmetric(14, 4)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    theme::label(ui, &self.status, theme::typew(11.5), theme::CREAM);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let t = match self.tool {
-                            Tool::Draw => "PENCIL",
-                            Tool::Brush => if self.bk == BrushKind::Relax { "BRUSH · RELAX" } else { "BRUSH · GRAB" },
-                            Tool::Edit => "EDIT",
-                        };
-                        theme::label(ui, t, theme::mono(11.0), theme::LAMP);
-                    });
-                });
-            });
     }
 
     fn rail(&mut self, ui: &mut egui::Ui) {
@@ -1458,11 +1418,10 @@ impl App {
             p.rect_stroke(r, 4.0, egui::Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
             p.galley(r.min + egui::vec2(10.0, 5.0), g, col);
         };
-        if let Some(m) = &self.mesh {
-            chip(rect.left_top() + egui::vec2(16.0, 16.0), egui::Align2::LEFT_TOP, &format!("MESH · {} TRIS", m.idx.len() / 3), theme::CREAM);
+        if self.mesh.is_some() {
             if self.patches.len() + self.live_patches.len() > 0 {
                 let l = self.low.map(|c| ((c * 0.45 + 0.55) * 255.0) as u8); // lightened so it reads on the dark chip
-                chip(rect.left_top() + egui::vec2(16.0, 50.0), egui::Align2::LEFT_TOP, &format!("{} PATCHES{}", self.patches.len() + self.live_patches.len(), if self.live { " · LIVE" } else { "" }), egui::Color32::from_rgb(l[0], l[1], l[2]));
+                chip(rect.left_top() + egui::vec2(16.0, 16.0), egui::Align2::LEFT_TOP, &format!("{} PATCHES{}", self.patches.len() + self.live_patches.len(), if self.live { " · LIVE" } else { "" }), egui::Color32::from_rgb(l[0], l[1], l[2]));
             }
             if self.tool == Tool::Edit {
                 chip(rect.center_top() + egui::vec2(0.0, 16.0), egui::Align2::CENTER_TOP, &format!("EDIT · {} FACES", self.fsel.len()), theme::LAMP);
@@ -1478,13 +1437,14 @@ impl App {
             p.text(c - egui::vec2(0.0, 20.0), egui::Align2::CENTER_CENTER, "NO CASE LOADED", theme::serif(30.0), theme::TITLE);
             p.text(c + egui::vec2(0.0, 16.0), egui::Align2::CENTER_CENTER, "Drop an .obj file here, or use Open with on one. (From Maya: Open viewer.)", theme::typew(13.0), theme::MUTED);
         }
-        p.text(
-            rect.left_bottom() + egui::vec2(16.0, -14.0),
-            egui::Align2::LEFT_CENTER,
-            "drag draw · Shift line · Space radial · Tab edit faces · B brush (R relax, V grab) · RMB/Alt+drag orbit · MMB pan · wheel zoom · Ctrl+Z",
-            theme::mono(10.0),
-            theme::MUTED,
-        );
+        let tool = match self.tool {
+            Tool::Draw => "PENCIL",
+            Tool::Edit => "EDIT",
+            Tool::Brush if self.bk == BrushKind::Relax => "BRUSH · RELAX",
+            Tool::Brush => "BRUSH · GRAB",
+        };
+        let hint = if self.strokes.is_empty() && self.mesh.is_some() { "  ·  Space menu  ·  P panel" } else { "" };
+        p.text(rect.left_bottom() + egui::vec2(14.0, -12.0), egui::Align2::LEFT_CENTER, format!("{tool}{hint}  ·  {}", self.status), theme::mono(10.5), theme::MUTED);
     }
 }
 

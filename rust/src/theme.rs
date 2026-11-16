@@ -19,7 +19,6 @@ pub const RED: Color32 = rgb(0xd4, 0x50, 0x3c);
 pub const CREAM: Color32 = rgb(0xd5, 0xd8, 0xdc);
 pub const TITLE: Color32 = rgb(0xf1, 0xf3, 0xf5);
 pub const MUTED: Color32 = rgb(0x8b, 0x91, 0x99);
-pub const GREEN: Color32 = rgb(0x5f, 0xc7, 0x7a);
 pub const BLUE: Color32 = rgb(0x6a, 0xa0, 0xff);
 pub const ORANGE_DARK: Color32 = rgb(0xc4, 0x57, 0x0a);
 
@@ -91,7 +90,6 @@ pub enum Kind {
     Red,
     Ink,
     Ghost,
-    GhostDark,
 }
 
 pub fn button(ui: &mut egui::Ui, text: &str, kind: Kind, size: Vec2) -> egui::Response {
@@ -99,7 +97,7 @@ pub fn button(ui: &mut egui::Ui, text: &str, kind: Kind, size: Vec2) -> egui::Re
         Kind::Amber => (LAMP, INK_DEEP, Stroke::NONE, disp(14.0)),
         Kind::Red => (RED, Color32::WHITE, Stroke::NONE, disp(16.0)),
         Kind::Ink => (rgb(0x3a, 0x3f, 0x47), TITLE, Stroke::NONE, typew(12.0)),
-        Kind::Ghost | Kind::GhostDark => (Color32::TRANSPARENT, CREAM, Stroke::new(1.0, rgb(0x4a, 0x50, 0x58)), typew(12.0)),
+        Kind::Ghost => (Color32::TRANSPARENT, CREAM, Stroke::new(1.0, rgb(0x4a, 0x50, 0x58)), typew(12.0)),
     };
     ui.add_sized(size, egui::Button::new(RichText::new(text).font(font).color(fg)).fill(fill).stroke(stroke).corner_radius(4.0))
 }
