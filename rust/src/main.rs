@@ -36,10 +36,11 @@ enum Tab {
 enum Tool {
     Draw,
     Relax,
+    Edit,
 }
 
 /// Pie menu slices, clockwise from the top.
-const PIE: [&str; 8] = ["DRAW", "RELAX", "GRID", "LIVE", "MIRROR", "EXPORT", "UNDO", "DELETE"];
+const PIE: [&str; 8] = ["PENCIL", "RELAX", "GRID", "LIVE", "MIRROR", "EXPORT", "UNDO", "EDIT"];
 
 const LOW_DEFAULT: [f32; 3] = [0.03, 0.14, 0.42]; // deep sea blue
 
@@ -77,7 +78,13 @@ struct App {
     tab: Tab,
     book: bool,
     tool: Tool,
-    pie: Option<egui::Pos2>, // Tab held: radial menu centred here
+    pie: Option<egui::Pos2>, // Space held: radial menu centred here
+    beauty: f32,             // stroke clean-up strength, 0 = off
+    fsel: Vec<(u32, u32)>,   // Edit tool: selected faces (patch, cell)
+    fsel_n: usize,           // patch count the selection belongs to
+    marq: Option<(egui::Pos2, egui::Pos2)>, // Edit tool: box selection
+    tab_prev: Tool,
+    tab_t: Option<std::time::Instant>,
     brush: Option<geom::Weld>, // welded view of the patches while a relax stroke is in progress
     relax_undo: Vec<Vec<(Vec<Vec3>, Vec<Vec3>)>>,
     brush_px: f32,
@@ -200,6 +207,12 @@ impl App {
             book: true,
             tool: Tool::Draw,
             pie: None,
+            beauty: 0.6,
+            fsel: vec![],
+            fsel_n: 0,
+            marq: None,
+            tab_prev: Tool::Draw,
+            tab_t: None,
             brush: None,
             relax_undo: vec![],
             brush_px: 70.0,
@@ -557,18 +570,19 @@ impl eframe::App for App {
             self.last_save = std::time::Instant::now();
             self.autosave();
         }
-        // Tab held = radial menu at the cursor; release on a slice to pick it
+        // Space held = radial menu at the cursor; release on a slice to pick it
         let typing = ui.ctx().egui_wants_keyboard_input();
-        let (tab_down, tab_hit) = ui.input(|i| (i.key_down(egui::Key::Tab), i.key_pressed(egui::Key::Tab)));
-        if tab_down || tab_hit {
+        let (space_down, space_hit, tab_down, tab_hit) =
+            ui.input(|i| (i.key_down(egui::Key::Space), i.key_pressed(egui::Key::Space), i.key_down(egui::Key::Tab), i.key_pressed(egui::Key::Tab)));
+        if space_down || space_hit || tab_down || tab_hit {
             if let Some(id) = ui.memory(|m| m.focused()) {
-                ui.memory_mut(|m| m.surrender_focus(id)); // Tab must not walk keyboard focus through the buttons
+                ui.memory_mut(|m| m.surrender_focus(id)); // keys must not walk keyboard focus through the buttons
             }
         }
-        if tab_hit && !typing && self.pie.is_none() {
+        if space_hit && !typing && self.pie.is_none() {
             self.pie = ui.input(|i| i.pointer.latest_pos());
         }
-        if !tab_down {
+        if !space_down {
             if let Some(c) = self.pie.take() {
                 if let Some(k) = ui.input(|i| i.pointer.latest_pos()).and_then(|p| Self::pie_pick(c, p)) {
                     self.pie_do(k);
@@ -576,6 +590,17 @@ impl eframe::App for App {
             }
         } else if self.pie.is_some() {
             ui.ctx().request_repaint();
+        }
+        // Tab: tap toggles Edit <-> pencil; hold = Edit while held, back to the pencil on release
+        if tab_hit && !typing && self.tab_t.is_none() {
+            self.tab_t = Some(std::time::Instant::now());
+            self.tab_prev = self.tool;
+            self.tool = Tool::Edit;
+        }
+        if !tab_down {
+            if let Some(t0) = self.tab_t.take() {
+                self.tool = if t0.elapsed() < Duration::from_millis(250) && self.tab_prev != Tool::Edit { Tool::Edit } else { Tool::Draw };
+            }
         }
         if !typing {
             let key = |k| ui.input(|i| i.key_pressed(k));
@@ -644,19 +669,18 @@ fn project2d(pts: &[Vec3], r: egui::Rect) -> Vec<egui::Pos2> {
 }
 
 fn rail_item(ui: &mut egui::Ui, label: &str, key: &str, ic: theme::Icon, active: bool) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(54.0, 60.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::click());
     let (bg, fg) = if active {
-        (theme::PAPER, theme::INK_DEEP)
+        (theme::LAMP.gamma_multiply(0.22), theme::LAMP)
     } else if resp.hovered() {
-        (theme::LEATHER, theme::CREAM)
+        (theme::LEATHER, theme::TITLE)
     } else {
-        (egui::Color32::TRANSPARENT, egui::Color32::from_rgb(0xc4, 0xb2, 0x94))
+        (egui::Color32::TRANSPARENT, theme::MUTED)
     };
     let p = ui.painter();
     p.rect_filled(rect, 6.0, bg);
-    theme::icon(p, rect.center_top() + egui::vec2(0.0, 20.0), ic, fg);
-    p.text(rect.center_bottom() - egui::vec2(0.0, 20.0), egui::Align2::CENTER_CENTER, label, theme::typew(10.0), fg);
-    p.text(rect.center_bottom() - egui::vec2(0.0, 8.0), egui::Align2::CENTER_CENTER, key, theme::mono(9.0), if active { theme::INK_SOFT } else { theme::MUTED });
+    theme::icon(p, rect.center_top() + egui::vec2(0.0, 18.0), ic, fg);
+    p.text(rect.center_bottom() - egui::vec2(0.0, 9.0), egui::Align2::CENTER_CENTER, label, theme::typew(9.5), fg);
     resp.on_hover_text(format!("{label}  ({key})")).clicked()
 }
 
@@ -669,6 +693,7 @@ impl App {
             (s.id, s.pts.len()).hash(&mut h);
         }
         self.selected.hash(&mut h);
+        self.fsel.hash(&mut h);
         (self.patches.len(), self.live_patches.len(), self.patch_rev).hash(&mut h);
         self.low.map(f32::to_bits).hash(&mut h);
         (self.sym, self.axis, self.plane.to_bits()).hash(&mut h);
@@ -727,7 +752,35 @@ impl App {
                 }
             }
         }
+        let sel: std::collections::HashSet<(u32, u32)> = self.fsel.iter().copied().collect();
+        if !sel.is_empty() {
+            let gold = [1.0, 0.82, 0.25];
+            for (key, c) in self.all_faces() {
+                if sel.contains(&key) {
+                    for k in 0..4 {
+                        g.psegs.push(Seg::new(c[k], c[(k + 1) % 4], gold, 3.6));
+                    }
+                    g.psegs.push(Seg::new(c[0], c[2], gold, 1.4));
+                    g.psegs.push(Seg::new(c[1], c[3], gold, 1.4));
+                }
+            }
+        }
         g
+    }
+
+    /// Every quad of every patch: key (patch, cell) and its four corners.
+    fn all_faces(&self) -> Vec<((u32, u32), [Vec3; 4])> {
+        let mut v = vec![];
+        for (pi, pa) in self.patches.iter().chain(&self.live_patches).enumerate() {
+            let w = pa.nu + 1;
+            for j in 0..pa.nv {
+                for i in 0..pa.nu {
+                    let k = j * w + i;
+                    v.push(((pi as u32, (j * pa.nu + i) as u32), [pa.pts[k], pa.pts[k + 1], pa.pts[k + w + 1], pa.pts[k + w]]));
+                }
+            }
+        }
+        v
     }
 
     fn begin_brush(&mut self) {
@@ -773,6 +826,7 @@ impl App {
     fn pie_do(&mut self, k: usize) {
         match k {
             0 => self.tool = Tool::Draw,
+            7 => self.tool = Tool::Edit,
             1 => {
                 self.tool = Tool::Relax;
                 self.tab = Tab::Relax;
@@ -782,7 +836,7 @@ impl App {
             4 => self.sym = !self.sym,
             5 => self.export(),
             6 => self.undo_patch(),
-            _ => self.delete_selected(),
+            _ => {}
         }
     }
 
@@ -791,7 +845,7 @@ impl App {
         let cur = ui.input(|i| i.pointer.latest_pos());
         let hot = cur.and_then(|p| Self::pie_pick(c, p));
         let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::NULL.with("pie")));
-        let on = [self.tool == Tool::Draw, self.tool == Tool::Relax, false, self.live, self.sym, false, false, false];
+        let on = [self.tool == Tool::Draw, self.tool == Tool::Relax, false, self.live, self.sym, false, false, self.tool == Tool::Edit];
         let (r0, r1, step) = (44.0f32, 128.0f32, std::f32::consts::FRAC_PI_4);
         let at = |r: f32, a: f32| c + egui::vec2(a.sin(), -a.cos()) * r;
         p.circle_filled(c, r1 + 10.0, egui::Color32::from_rgba_unmultiplied(8, 5, 3, 120));
@@ -811,7 +865,7 @@ impl App {
         }
         p.circle_filled(c, r0 - 6.0, theme::NOIR);
         p.circle_stroke(c, r0 - 6.0, egui::Stroke::new(1.0, theme::LINE));
-        p.text(c, egui::Align2::CENTER_CENTER, hot.map_or("TAB", |k| PIE[k]), theme::serif(11.0), theme::TITLE);
+        p.text(c, egui::Align2::CENTER_CENTER, hot.map_or("SPACE", |k| PIE[k]), theme::serif(11.0), theme::TITLE);
     }
 
     fn toggle_live(&mut self) {
@@ -834,23 +888,18 @@ impl App {
     fn header(&mut self, ui: &mut egui::Ui) {
         let name = PathBuf::from(&self.path).file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
         egui::Panel::top("hdr")
-            .frame(egui::Frame::new().fill(theme::NOIR).stroke(egui::Stroke::new(1.0, theme::LINE)).inner_margin(egui::Margin::symmetric(16, 8)))
+            .frame(egui::Frame::new().fill(theme::NOIR).stroke(egui::Stroke::new(1.0, theme::LINE)).inner_margin(egui::Margin::symmetric(14, 6)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    theme::label(ui, "RETOPO", theme::serif(19.0), theme::TITLE);
-                    theme::label(ui, "EZ", theme::serif(19.0), theme::RED);
-                    ui.add_space(14.0);
-                    theme::label(ui, format!("The Casebook  ·  {name}"), theme::typew(12.0), theme::MUTED);
+                    theme::label(ui, "RetopoEZ", egui::FontId::proportional(15.0), theme::TITLE);
+                    ui.add_space(10.0);
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 3.5, if self.mesh.is_some() { theme::GREEN } else { theme::LAMP });
+                    theme::label(ui, if name.is_empty() { "no file".to_string() } else { name }, theme::typew(12.0), theme::MUTED);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 10.0;
-                        if theme::button(ui, if self.book { "HIDE BOOK  (P)" } else { "SHOW BOOK  (P)" }, theme::Kind::GhostDark, egui::vec2(120.0, 26.0)).clicked() {
+                        if theme::button(ui, if self.book { "Hide panel  P" } else { "Panel  P" }, theme::Kind::GhostDark, egui::vec2(96.0, 24.0)).clicked() {
                             self.book = !self.book;
                         }
-                        let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                        let (col, txt) = if self.mesh.is_some() { (theme::GREEN, "MESH LOADED") } else { (theme::LAMP, "NO MESH") };
-                        ui.painter().circle_filled(r.center(), 4.0, col);
-                        theme::label(ui, txt, theme::typew(11.0), egui::Color32::from_rgb(0xc4, 0xb2, 0x94));
                     });
                 });
             });
@@ -858,14 +907,17 @@ impl App {
 
     fn footer(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("ftr")
-            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(0x0a, 0x07, 0x05)).inner_margin(egui::Margin::symmetric(16, 5)))
+            .frame(egui::Frame::new().fill(theme::NOIR).stroke(egui::Stroke::new(1.0, theme::LINE)).inner_margin(egui::Margin::symmetric(14, 4)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    theme::label(ui, "›", theme::typew(13.0), theme::LAMP);
-                    theme::label(ui, self.status.to_uppercase(), theme::typew(11.0), egui::Color32::from_rgb(0xc4, 0xb2, 0x94));
+                    theme::label(ui, &self.status, theme::typew(11.5), theme::CREAM);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let t = if self.patches.is_empty() && self.live_patches.is_empty() { "draw strokes, then grid or auto patch" } else { "press E: saves <name>_retopo.obj beside the mesh" };
-                        theme::label(ui, t, theme::typew(11.0), theme::MUTED);
+                        let t = match self.tool {
+                            Tool::Draw => "PENCIL",
+                            Tool::Relax => "RELAX",
+                            Tool::Edit => "EDIT",
+                        };
+                        theme::label(ui, t, theme::mono(11.0), theme::LAMP);
                     });
                 });
             });
@@ -873,106 +925,97 @@ impl App {
 
     fn rail(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("rail")
-            .exact_size(66.0)
+            .exact_size(64.0)
             .resizable(false)
-            .frame(egui::Frame::new().fill(theme::RAIL).stroke(egui::Stroke::new(1.0, theme::LINE)).inner_margin(egui::Margin::symmetric(6, 10)))
+            .frame(egui::Frame::new().fill(theme::RAIL).stroke(egui::Stroke::new(1.0, theme::LINE)).inner_margin(egui::Margin::symmetric(6, 8)))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    if rail_item(ui, "GRID", "G", theme::Icon::Grid, false) {
-                        self.grid_by_selection();
-                    }
-                    if rail_item(ui, "AUTO", "A", theme::Icon::Auto, false) {
-                        self.auto();
-                    }
-                    if rail_item(ui, "LIVE", "L", theme::Icon::Live, self.live) {
-                        self.toggle_live();
-                    }
-                    if rail_item(ui, "RELAX", "R", theme::Icon::Relax, self.tool == Tool::Relax) {
-                        self.tool = if self.tool == Tool::Relax { Tool::Draw } else { Tool::Relax };
-                    }
-                    if rail_item(ui, "MIRROR", "M", theme::Icon::Mirror, self.sym) {
-                        self.sym = !self.sym;
-                    }
-                    if rail_item(ui, "UNDO", "patch", theme::Icon::Undo, false) {
-                        self.undo_patch();
-                    }
-                    if rail_item(ui, "EXPORT", "E", theme::Icon::Export, false) {
-                        self.export();
-                    }
-                });
+                ui.spacing_mut().item_spacing.y = 2.0;
+                if rail_item(ui, "Pencil", "default", theme::Icon::Pencil, self.tool == Tool::Draw) {
+                    self.tool = Tool::Draw;
+                }
+                if rail_item(ui, "Edit", "Tab", theme::Icon::Edit, self.tool == Tool::Edit) {
+                    self.tool = if self.tool == Tool::Edit { Tool::Draw } else { Tool::Edit };
+                }
+                if rail_item(ui, "Relax", "R", theme::Icon::Relax, self.tool == Tool::Relax) {
+                    self.tool = if self.tool == Tool::Relax { Tool::Draw } else { Tool::Relax };
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                if rail_item(ui, "Grid", "G", theme::Icon::Grid, false) {
+                    self.grid_by_selection();
+                }
+                if rail_item(ui, "Auto", "A", theme::Icon::Auto, false) {
+                    self.auto();
+                }
+                if rail_item(ui, "Live", "L", theme::Icon::Live, self.live) {
+                    self.toggle_live();
+                }
+                if rail_item(ui, "Mirror", "M", theme::Icon::Mirror, self.sym) {
+                    self.sym = !self.sym;
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                if rail_item(ui, "Undo", "Ctrl+Z", theme::Icon::Undo, false) {
+                    self.undo_patch();
+                }
+                if rail_item(ui, "Export", "E", theme::Icon::Export, false) {
+                    self.export();
+                }
             });
     }
 
-    /// Right-hand "book": folder tabs on top, one parchment page below.
+    /// Right-hand panel: flat tabs on top, one page below.
     fn book(&mut self, ui: &mut egui::Ui) {
         egui::Panel::right("book")
-            .exact_size(350.0)
+            .exact_size(310.0)
             .resizable(false)
-            .frame(egui::Frame::new().fill(theme::NOIR).inner_margin(egui::Margin { left: 10, right: 12, top: 10, bottom: 12 }))
+            .frame(egui::Frame::new().fill(theme::PANEL).stroke(egui::Stroke::new(1.0, theme::LINE)).inner_margin(egui::Margin::same(12)))
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                // --- tabs
-                let tabs = [(Tab::Strokes, "STROKES"), (Tab::Grid, "GRID"), (Tab::Auto, "AUTO"), (Tab::Mirror, "MIRROR"), (Tab::Relax, "RELAX"), (Tab::Export, "EXPORT")];
-                let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::hover());
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let tabs = [(Tab::Strokes, "Strokes"), (Tab::Grid, "Grid"), (Tab::Auto, "Auto"), (Tab::Mirror, "Mirror"), (Tab::Relax, "Relax"), (Tab::Export, "Export")];
+                let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
                 let w = row.width() / tabs.len() as f32;
-                let top = egui::CornerRadius { nw: 7, ne: 7, sw: 0, se: 0 };
                 for (k, (tab, name)) in tabs.iter().enumerate() {
-                    let r = egui::Rect::from_min_size(row.min + egui::vec2(w * k as f32, 0.0), egui::vec2(w - 3.0, 34.0));
+                    let r = egui::Rect::from_min_size(row.min + egui::vec2(w * k as f32, 0.0), egui::vec2(w, 28.0));
                     let resp = ui.interact(r, ui.scope_id().with(("tab", k)), egui::Sense::click());
                     let on = self.tab == *tab;
-                    let r = if on { r } else { r.with_min_y(r.min.y + 5.0) };
                     let p = ui.painter();
-                    p.rect_filled(r, top, if on { theme::PAPER } else if resp.hovered() { egui::Color32::from_rgb(0x36, 0x25, 0x18) } else { theme::LEATHER });
-                    if !on {
-                        p.rect_stroke(r, top, egui::Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
+                    p.text(r.center(), egui::Align2::CENTER_CENTER, *name, theme::typew(12.0), if on { theme::TITLE } else if resp.hovered() { theme::CREAM } else { theme::MUTED });
+                    if on {
+                        p.line_segment([r.left_bottom() + egui::vec2(6.0, 0.0), r.right_bottom() - egui::vec2(6.0, 0.0)], egui::Stroke::new(2.0, theme::LAMP));
                     }
-                    let label = name.to_string();
-                    p.text(r.center() + egui::vec2(0.0, 1.0), egui::Align2::CENTER_CENTER, label, theme::typew(10.5), if on { theme::INK } else { theme::CREAM });
                     if resp.clicked() {
                         self.tab = *tab;
                     }
                 }
-                // --- page
-                let page = egui::Frame::new().fill(theme::PAPER).corner_radius(egui::CornerRadius { nw: 0, ne: 4, sw: 4, se: 4 }).inner_margin(egui::Margin::same(18)).show(ui, |ui| {
+                ui.separator();
+                theme::paper_visuals(ui);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    theme::paper_visuals(ui);
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
+                    match self.tab {
                         Tab::Strokes => self.page_strokes(ui),
                         Tab::Grid => self.page_grid(ui),
                         Tab::Auto => self.page_auto(ui),
                         Tab::Mirror => self.page_mirror(ui),
                         Tab::Relax => self.page_relax(ui),
                         Tab::Export => self.page_export(ui),
-                    });
+                    }
                 });
-                let pr = page.response.rect;
-                let clip = ui.painter().with_clip_rect(pr);
-                theme::edge_shade(&clip, pr, 26.0);
-                theme::rings(ui.painter(), pr);
-                if self.patches.len() + self.live_patches.len() > 0 {
-                    let g = ui.painter().layout_no_wrap(format!("{} PATCHES", self.patches.len() + self.live_patches.len()), theme::serif(13.0), theme::RED);
-                    let c = pr.right_top() + egui::vec2(-70.0, 34.0);
-                    let ang = -0.12f32;
-                    let half = g.size() * 0.5 + egui::vec2(9.0, 4.0);
-                    let rot = |x: f32, y: f32| c + egui::vec2(x * ang.cos() - y * ang.sin(), x * ang.sin() + y * ang.cos());
-                    let st = egui::Stroke::new(2.0, theme::RED.gamma_multiply(0.85));
-                    ui.painter().add(egui::Shape::closed_line(vec![rot(-half.x, -half.y), rot(half.x, -half.y), rot(half.x, half.y), rot(-half.x, half.y)], st));
-                    ui.painter().add(egui::epaint::TextShape::new(c, g, theme::RED).with_angle_and_anchor(ang, egui::Align2::CENTER_CENTER));
-                }
             });
     }
 
     fn heading(ui: &mut egui::Ui, title: &str, note: &str) {
-        theme::label(ui, title, theme::serif(24.0), theme::INK);
-        theme::label(ui, note, theme::hand(18.0), theme::INK_SOFT);
+        theme::label(ui, title, egui::FontId::proportional(16.0), theme::TITLE);
+        theme::label(ui, note, theme::typew(11.5), theme::MUTED);
         ui.add_space(2.0);
-        ui.separator();
     }
 
     fn page_strokes(&mut self, ui: &mut egui::Ui) {
         Self::heading(ui, "Evidence", &format!("Collected: {} strokes · {} picked", self.strokes.len(), self.selected.len()));
         ui.checkbox(&mut self.smart, egui::RichText::new("Recognise circles & ellipses").font(theme::typew(12.0)));
+        ui.add(egui::Slider::new(&mut self.beauty, 0.0..=1.0).text("SMOOTH STROKES"));
         ui.checkbox(&mut self.snap_ends, egui::RichText::new("Snap stroke ends to nearby strokes").font(theme::typew(12.0)));
         theme::label(ui, "Hold Shift while dragging for a straight line.", theme::hand(17.0), theme::INK_SOFT);
         ui.horizontal(|ui| {
@@ -992,9 +1035,9 @@ impl App {
             let sel = self.selected.contains(&s.id);
             let p = ui.painter();
             p.rect_filled(rect, 3.0, if sel { theme::LAMP } else if resp.hovered() { theme::PAPER_LIGHT } else { theme::PAPER_LIGHT.gamma_multiply(0.55) });
-            p.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, if sel { theme::INK } else { theme::INK_SOFT.gamma_multiply(0.5) }), egui::StrokeKind::Inside);
+            p.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, if sel { theme::LAMP } else { theme::INK_SOFT.gamma_multiply(0.5) }), egui::StrokeKind::Inside);
             p.circle_filled(rect.left_center() + egui::vec2(12.0, 0.0), 4.0, theme::RED);
-            p.text(rect.left_center() + egui::vec2(26.0, -7.0), egui::Align2::LEFT_CENTER, format!("Stroke {:02}", n + 1), theme::typew(12.0), theme::INK);
+            p.text(rect.left_center() + egui::vec2(26.0, -7.0), egui::Align2::LEFT_CENTER, format!("Stroke {:02}", n + 1), theme::typew(12.0), if sel { theme::INK_DEEP } else { theme::INK });
             let twin = s.partner.and_then(|pid| self.strokes.iter().position(|x| x.id == pid));
             let tag = match (geom::is_closed(&s.pts), twin) {
                 (true, Some(k)) => format!("ring · twin {:02}", k + 1),
@@ -1210,8 +1253,15 @@ impl App {
                             self.status = why.into();
                         }
                     }
+                    let mut tw = Some(tw);
+                    if self.beauty > 0.0 {
+                        if let Some(m) = &self.mesh {
+                            s = geom::beautify(m, &s, self.beauty, m.diag * 2e-4);
+                            tw = None; // the mirrored twin is rebuilt from the cleaned stroke
+                        }
+                    }
                     let moved = self.connect_ends(&mut s);
-                    self.push_stroke(s, if moved { None } else { Some(tw) });
+                    self.push_stroke(s, if moved { None } else { tw });
                 }
             }
         }
@@ -1238,6 +1288,80 @@ impl App {
                     None => self.selected.clear(),
                 }
             }
+        }
+
+        // Edit tool: click a face, Shift/Ctrl+click to add or remove, drag a box to select several
+        let npatch = self.patches.len() + self.live_patches.len();
+        if npatch != self.fsel_n {
+            self.fsel_n = npatch;
+            self.fsel.clear();
+        }
+        if self.tool != Tool::Edit {
+            self.marq = None;
+        } else if !busy && !alt {
+            let add = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+            let scr = |q: Vec3| {
+                let c = vp * q.extend(1.0);
+                egui::pos2(rect.min.x + (c.x / c.w * 0.5 + 0.5) * rect.width(), rect.min.y + (0.5 - c.y / c.w * 0.5) * rect.height())
+            };
+            let faces = if resp.dragged_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary) || self.marq.is_some() { self.all_faces() } else { vec![] };
+            let visible = |c: Vec3| match &self.mesh {
+                Some(m) if faces.len() < 30000 => {
+                    let d = c - eye;
+                    let l = d.length().max(1e-9);
+                    geom::raycast(m, eye, d / l).map_or(true, |(t, _)| t > l - m.diag * 0.01)
+                }
+                _ => true,
+            };
+            let mut picked: Option<Vec<(u32, u32)>> = None;
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                if let (Some(o), Some(p)) = (ui.input(|i| i.pointer.press_origin()), resp.interact_pointer_pos()) {
+                    self.marq = Some((o, p));
+                }
+            } else if let Some((a, b)) = self.marq.take() {
+                let r = egui::Rect::from_two_pos(a, b);
+                if r.width() > 4.0 || r.height() > 4.0 {
+                    picked = Some(faces.iter().filter(|(_, c)| r.contains(scr((c[0] + c[1] + c[2] + c[3]) * 0.25)) && visible((c[0] + c[1] + c[2] + c[3]) * 0.25)).map(|(k, _)| *k).collect());
+                }
+            }
+            if resp.clicked_by(egui::PointerButton::Primary) {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let inside = |q: [egui::Pos2; 4]| {
+                        let tri = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+                            let s = |p1: egui::Pos2, p2: egui::Pos2, p3: egui::Pos2| (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+                            let (d1, d2, d3) = (s(p, a, b), s(p, b, c), s(p, c, a));
+                            !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+                        };
+                        tri(q[0], q[1], q[2]) || tri(q[0], q[2], q[3])
+                    };
+                    let mut hits: Vec<(f32, (u32, u32))> = faces
+                        .iter()
+                        .filter(|(_, c)| inside([scr(c[0]), scr(c[1]), scr(c[2]), scr(c[3])]))
+                        .map(|(k, c)| (((c[0] + c[1] + c[2] + c[3]) * 0.25 - eye).length(), *k))
+                        .collect();
+                    hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let top = hits.into_iter().find(|(_, k)| faces.iter().find(|f| f.0 == *k).map_or(false, |f| visible((f.1[0] + f.1[1] + f.1[2] + f.1[3]) * 0.25)));
+                    picked = Some(top.map(|(_, k)| vec![k]).unwrap_or_default());
+                }
+            }
+            if let Some(ks) = picked {
+                if !add {
+                    self.fsel.clear();
+                }
+                for k in ks {
+                    match self.fsel.iter().position(|x| *x == k) {
+                        Some(i) if add => {
+                            self.fsel.remove(i);
+                        }
+                        Some(_) => {}
+                        None => self.fsel.push(k),
+                    }
+                }
+                self.status = format!("{} faces selected", self.fsel.len());
+            }
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.fsel.clear();
         }
 
         // geometry buffers are rebuilt only when something changed; the stroke being drawn is tiny and goes every frame
@@ -1275,6 +1399,11 @@ impl App {
                 p.circle_stroke(h, self.brush_px * (1.0 - self.brush_strength), egui::Stroke::new(1.0, theme::LAMP.gamma_multiply(0.45)));
             }
         }
+        if let Some((a, b)) = self.marq {
+            let r = egui::Rect::from_two_pos(a, b);
+            p.rect_filled(r, 0.0, egui::Color32::from_rgba_unmultiplied(255, 210, 70, 28));
+            p.rect_stroke(r, 0.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 210, 70)), egui::StrokeKind::Inside);
+        }
         let chip = |pos: egui::Pos2, align: egui::Align2, t: &str, col: egui::Color32| {
             let g = p.layout_no_wrap(t.to_string(), theme::typew(12.0), col);
             let r = align.anchor_size(pos, g.size()).expand2(egui::vec2(10.0, 5.0));
@@ -1287,6 +1416,9 @@ impl App {
             if self.patches.len() + self.live_patches.len() > 0 {
                 let l = self.low.map(|c| ((c * 0.45 + 0.55) * 255.0) as u8); // lightened so it reads on the dark chip
                 chip(rect.left_top() + egui::vec2(16.0, 50.0), egui::Align2::LEFT_TOP, &format!("{} PATCHES{}", self.patches.len() + self.live_patches.len(), if self.live { " · LIVE" } else { "" }), egui::Color32::from_rgb(l[0], l[1], l[2]));
+            }
+            if self.tool == Tool::Edit {
+                chip(rect.center_top() + egui::vec2(0.0, 16.0), egui::Align2::CENTER_TOP, &format!("EDIT · {} FACES", self.fsel.len()), theme::LAMP);
             }
             if self.tool == Tool::Relax {
                 chip(rect.center_top() + egui::vec2(0.0, 16.0), egui::Align2::CENTER_TOP, "RELAX BRUSH", theme::LAMP);
@@ -1302,7 +1434,7 @@ impl App {
         p.text(
             rect.left_bottom() + egui::vec2(16.0, -14.0),
             egui::Align2::LEFT_CENTER,
-            "drag draw · Shift line · click select · hold Tab radial menu · R relax · RMB/Alt+drag orbit · MMB pan · wheel zoom · Ctrl+Z · Del",
+            "drag draw · Shift line · Space radial · Tab edit faces · R relax · RMB/Alt+drag orbit · MMB pan · wheel zoom · Ctrl+Z",
             theme::mono(10.0),
             theme::MUTED,
         );

@@ -242,6 +242,50 @@ pub fn sample(s: &[Vec3], n: usize) -> Vec<Vec3> {
         .collect()
 }
 
+
+/// Clean up a hand-drawn stroke: even resampling, Taubin smoothing (no shrinkage) that keeps
+/// deliberate sharp corners and both ends, near-straight strokes become straight, then re-snap to the surface.
+pub fn beautify(m: &Mesh, s: &[Vec3], strength: f32, lift: f32) -> Vec<Vec3> {
+    let len = path_len(s);
+    if s.len() < 3 || len < m.diag * 0.01 || strength <= 0.0 {
+        return s.to_vec();
+    }
+    let n = ((len / (m.diag * 0.008)) as usize).clamp(4, 160);
+    let mut p = sample(s, n);
+    // straight?
+    let (a, b) = (p[0], p[n]);
+    let ch = (b - a).normalize_or_zero();
+    let dev = p.iter().map(|q| (*q - a - ch * (*q - a).dot(ch)).length()).fold(0.0, f32::max);
+    if ch != Vec3::ZERO && dev < len * 0.03 * strength.max(0.3) {
+        p = (0..=n).map(|k| a.lerp(b, k as f32 / n as f32)).collect();
+    } else {
+        // corners: turning angle over +-2 samples above 65 degrees stay put
+        let corner: Vec<bool> = (0..=n)
+            .map(|i| {
+                if i < 2 || i + 2 > n {
+                    return true;
+                }
+                let (d1, d2) = ((p[i] - p[i - 2]).normalize_or_zero(), (p[i + 2] - p[i]).normalize_or_zero());
+                d1.dot(d2) < 65f32.to_radians().cos()
+            })
+            .collect();
+        let rounds = (3.0 + strength * 14.0) as usize;
+        for r in 0..rounds * 2 {
+            let k = if r % 2 == 0 { 0.5 } else { -0.53 };
+            let q = p.clone();
+            for i in 1..n {
+                if !corner[i] {
+                    p[i] = q[i] + k * ((q[i - 1] + q[i + 1]) * 0.5 - q[i]);
+                }
+            }
+        }
+    }
+    p.iter().map(|&q| {
+        let (c, nrm) = closest(m, q);
+        c + nrm * lift
+    }).collect()
+}
+
 /// Reverse b if it runs opposite to a.
 pub fn align(a: &[Vec3], mut b: Vec<Vec3>) -> Vec<Vec3> {
     let (n, m) = (a.len() - 1, b.len() - 1);
@@ -1312,6 +1356,16 @@ mod ring_snap_tests {
             }
         }
         Mesh::new(pos, idx)
+    }
+
+    #[test]
+    fn beautify_smooths_noise_keeps_ends() {
+        let m = Mesh::new(vec![Vec3::new(-5., -5., 0.), Vec3::new(5., -5., 0.), Vec3::new(5., 5., 0.), Vec3::new(-5., 5., 0.)], vec![0, 1, 2, 0, 2, 3]);
+        let raw: Vec<Vec3> = (0..=40).map(|k| Vec3::new(-4.0 + k as f32 * 0.2, 2.0 + ((k * 7 % 5) as f32 - 2.0) * 0.05 + (k as f32 * 0.2).sin(), 0.0)).collect();
+        let out = beautify(&m, &raw, 0.7, 0.0);
+        let rough = |v: &[Vec3]| v.windows(3).map(|w| (w[0] + w[2] - 2.0 * w[1]).length()).sum::<f32>() / v.len() as f32;
+        assert!(rough(&out) < rough(&raw) * 0.5, "{} {}", rough(&out), rough(&raw));
+        assert!(out[0].distance(raw[0]) < 0.3 && out.last().unwrap().distance(*raw.last().unwrap()) < 0.3);
     }
 
     #[test]
