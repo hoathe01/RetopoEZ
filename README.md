@@ -59,5 +59,5 @@ Viewer là một file exe riêng. Mở bằng cách:
 Lần sau mở viewer không kèm file, nó mở lại file lần trước. Export (phím E) lưu `<tên>_retopo.obj` cạnh file gốc; import vào Maya hay phần mềm khác bằng File → Import. Cầu nối Maya (`retopoez.py`) vẫn dùng được nhưng không bắt buộc.
 
 ## Phím tắt chính
-Space (giữ) = menu radial · Tab (bấm) = bật/tắt Edit chọn mặt, Tab (giữ) = Edit tạm thời rồi thả về pencil · Shift+kéo = đường thẳng · R relax · G grid · A auto · L live · M mirror · E export · Ctrl+Z.
+Space (giữ) = menu radial · Tab (bấm) = bật/tắt Edit, Tab (giữ) = Edit tạm thời · B hoặc 1 = Brush (R relax, V grab, [ ] đổi cỡ, Ctrl+chuột phải kéo = cỡ/độ cứng) · Shift+kéo = đường thẳng · G grid · A auto · L live · M mirror · E export · Ctrl+Z.
 Edit: giữ Tab, giữ chuột rồi di qua các mặt để chọn chúng; thả Tab về pencil. Click một mặt để chọn/bỏ chọn, click chỗ trống bỏ hết, Esc bỏ hết.

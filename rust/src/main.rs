@@ -28,19 +28,25 @@ enum Tab {
     Auto,
     Mirror,
     Strokes,
-    Relax,
+    Brush,
     Export,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
     Draw,
-    Relax,
+    Brush,
     Edit,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum BrushKind {
+    Relax,
+    Grab,
+}
+
 /// Pie menu slices, clockwise from the top.
-const PIE: [&str; 8] = ["PENCIL", "RELAX", "GRID", "LIVE", "MIRROR", "EXPORT", "UNDO", "EDIT"];
+const PIE: [&str; 8] = ["PENCIL", "BRUSH", "GRID", "LIVE", "MIRROR", "EXPORT", "UNDO", "EDIT"];
 
 const LOW_DEFAULT: [f32; 3] = [0.03, 0.14, 0.42]; // deep sea blue
 
@@ -80,8 +86,13 @@ struct App {
     tool: Tool,
     pie: Option<egui::Pos2>, // Space held: radial menu centred here
     beauty: f32,             // stroke clean-up strength, 0 = off
-    fsel: Vec<(u32, u32)>,   // Edit tool: selected faces (patch, cell)
-    fsel_n: usize,           // patch count the selection belongs to
+    fsel: std::collections::HashSet<usize>, // Edit tool: selected faces (index into `faces`)
+    fsel_n: usize,                          // face count the selection belongs to
+    faces: Vec<[Vec3; 4]>,                  // every quad of every patch, rebuilt when the patches change
+    faces_key: (usize, usize, u32),
+    bk: BrushKind,
+    brush_hard: f32,
+    grab: Option<(Vec<f32>, Vec<f32>, f32)>, // Grab brush: weights, mirrored weights, world units per pixel
     tab_prev: Tool,
     tab_t: Option<std::time::Instant>,
     brush: Option<geom::Weld>, // welded view of the patches while a relax stroke is in progress
@@ -207,8 +218,13 @@ impl App {
             tool: Tool::Draw,
             pie: None,
             beauty: 0.6,
-            fsel: vec![],
+            fsel: Default::default(),
             fsel_n: 0,
+            faces: vec![],
+            faces_key: (usize::MAX, 0, 0),
+            bk: BrushKind::Relax,
+            brush_hard: 0.3,
+            grab: None,
             tab_prev: Tool::Draw,
             tab_t: None,
             brush: None,
@@ -482,6 +498,7 @@ impl App {
         let r = geom::auto_patches(m, &st, m.diag * self.snap * 1e-3, m.diag * self.edge * 0.01);
         self.auto_note = format!("live: {} cells, {} skipped, {} ms", r.patches.len(), r.skipped, t.elapsed().as_millis());
         self.live_patches = r.patches;
+        self.patch_rev += 1;
     }
 
     /// Stroke ends within 16 px of another stroke jump onto it, so nets close without exact aim.
@@ -602,8 +619,20 @@ impl eframe::App for App {
         }
         if !typing {
             let key = |k| ui.input(|i| i.key_pressed(k));
+            if key(egui::Key::B) || key(egui::Key::Num1) {
+                self.tool = if self.tool == Tool::Brush { Tool::Draw } else { Tool::Brush };
+            }
             if key(egui::Key::R) {
-                self.tool = if self.tool == Tool::Relax { Tool::Draw } else { Tool::Relax };
+                (self.tool, self.bk, self.tab) = (Tool::Brush, BrushKind::Relax, Tab::Brush);
+            }
+            if key(egui::Key::V) {
+                (self.tool, self.bk, self.tab) = (Tool::Brush, BrushKind::Grab, Tab::Brush);
+            }
+            if key(egui::Key::OpenBracket) {
+                self.brush_px = (self.brush_px * 0.85).max(8.0);
+            }
+            if key(egui::Key::CloseBracket) {
+                self.brush_px = (self.brush_px / 0.85).min(300.0);
             }
             if key(egui::Key::G) {
                 self.grid_by_selection();
@@ -626,7 +655,7 @@ impl eframe::App for App {
             if key(egui::Key::Delete) {
                 self.delete_selected();
             }
-            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) && !(self.tool == Tool::Relax && self.undo_relax()) && !self.strokes.is_empty() {
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) && !(self.tool == Tool::Brush && self.undo_relax()) && !self.strokes.is_empty() {
                 self.undo_stroke();
             }
         }
@@ -691,7 +720,6 @@ impl App {
             (s.id, s.pts.len()).hash(&mut h);
         }
         self.selected.hash(&mut h);
-        self.fsel.hash(&mut h);
         (self.patches.len(), self.live_patches.len(), self.patch_rev).hash(&mut h);
         self.low.map(f32::to_bits).hash(&mut h);
         (self.sym, self.axis, self.plane.to_bits()).hash(&mut h);
@@ -750,35 +778,61 @@ impl App {
                 }
             }
         }
-        let sel: std::collections::HashSet<(u32, u32)> = self.fsel.iter().copied().collect();
-        if !sel.is_empty() {
-            let gold = [1.0, 0.82, 0.25];
-            for (key, c) in self.all_faces() {
-                if sel.contains(&key) {
-                    for k in 0..4 {
-                        g.psegs.push(Seg::new(c[k], c[(k + 1) % 4], gold, 3.6));
-                    }
-                    g.psegs.push(Seg::new(c[0], c[2], gold, 1.4));
-                    g.psegs.push(Seg::new(c[1], c[3], gold, 1.4));
-                }
-            }
-        }
         g
     }
 
-    /// Every quad of every patch: key (patch, cell) and its four corners.
-    fn all_faces(&self) -> Vec<((u32, u32), [Vec3; 4])> {
-        let mut v = vec![];
-        for (pi, pa) in self.patches.iter().chain(&self.live_patches).enumerate() {
+    /// Cache of every quad (patch order, row-major); selection indices point into it.
+    fn ensure_faces(&mut self) {
+        let key = (self.patches.len(), self.live_patches.len(), self.patch_rev);
+        if self.faces_key == key {
+            return;
+        }
+        self.faces_key = key;
+        self.faces.clear();
+        for pa in self.patches.iter().chain(&self.live_patches) {
             let w = pa.nu + 1;
             for j in 0..pa.nv {
                 for i in 0..pa.nu {
                     let k = j * w + i;
-                    v.push(((pi as u32, (j * pa.nu + i) as u32), [pa.pts[k], pa.pts[k + 1], pa.pts[k + w + 1], pa.pts[k + w]]));
+                    self.faces.push([pa.pts[k], pa.pts[k + 1], pa.pts[k + w + 1], pa.pts[k + w]]);
                 }
             }
         }
-        v
+    }
+
+    /// Nearest face under the cursor that is not hidden by the high mesh.
+    fn pick_face(&self, vp: Mat4, rect: egui::Rect, p: egui::Pos2, eye: Vec3) -> Option<usize> {
+        let scr = |q: Vec3| {
+            let c = vp * q.extend(1.0);
+            egui::pos2(rect.min.x + (c.x / c.w * 0.5 + 0.5) * rect.width(), rect.min.y + (0.5 - c.y / c.w * 0.5) * rect.height())
+        };
+        let tri = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+            let s = |p1: egui::Pos2, p2: egui::Pos2, p3: egui::Pos2| (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+            let (d1, d2, d3) = (s(p, a, b), s(p, b, c), s(p, c, a));
+            !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+        };
+        let mut hits: Vec<(f32, usize)> = (0..self.faces.len())
+            .filter(|&i| {
+                let q = self.faces[i].map(scr);
+                tri(q[0], q[1], q[2]) || tri(q[0], q[2], q[3])
+            })
+            .map(|i| (((self.faces[i][0] + self.faces[i][2]) * 0.5 - eye).length(), i))
+            .collect();
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        hits.into_iter().map(|h| h.1).find(|&i| {
+            let c = (self.faces[i][0] + self.faces[i][2]) * 0.5;
+            let d = c - eye;
+            let l = d.length().max(1e-9);
+            self.mesh.as_ref().map_or(true, |m| geom::raycast(m, eye, d / l).map_or(true, |(t, _)| t > l - m.diag * 0.01))
+        })
+    }
+
+    /// The face on the other side of the symmetry plane.
+    fn mirror_face(&self, i: usize) -> Option<usize> {
+        let m = self.mesh.as_ref()?;
+        let mc = geom::mirror_on_surface(m, (self.faces[i][0] + self.faces[i][2]) * 0.5, self.axis, self.plane, 0.0);
+        let (j, d) = (0..self.faces.len()).map(|j| (j, ((self.faces[j][0] + self.faces[j][2]) * 0.5).distance(mc))).min_by(|a, b| a.1.total_cmp(&b.1))?;
+        (d < m.diag * 0.03).then_some(j)
     }
 
     fn begin_brush(&mut self) {
@@ -787,7 +841,7 @@ impl App {
         }
         let Some(m) = &self.mesh else { return };
         if self.patches.is_empty() {
-            self.status = "relax: no patches yet, build a grid or freeze live auto first".into();
+            self.status = "brush: no patches yet, build a grid or freeze live auto first".into();
             return;
         }
         let tol = (m.diag * self.weld * 1e-3).max(1e-7);
@@ -805,7 +859,7 @@ impl App {
                     (p.pts, p.nrm) = (pts, nrm);
                 }
                 self.patch_rev += 1;
-                self.status = "relax undone".into();
+                self.status = "brush undone".into();
                 return true;
             }
         }
@@ -825,10 +879,7 @@ impl App {
         match k {
             0 => self.tool = Tool::Draw,
             7 => self.tool = Tool::Edit,
-            1 => {
-                self.tool = Tool::Relax;
-                self.tab = Tab::Relax;
-            }
+            1 => (self.tool, self.tab) = (Tool::Brush, Tab::Brush),
             2 => self.grid_by_selection(),
             3 => self.toggle_live(),
             4 => self.sym = !self.sym,
@@ -843,7 +894,7 @@ impl App {
         let cur = ui.input(|i| i.pointer.latest_pos());
         let hot = cur.and_then(|p| Self::pie_pick(c, p));
         let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::NULL.with("pie")));
-        let on = [self.tool == Tool::Draw, self.tool == Tool::Relax, false, self.live, self.sym, false, false, self.tool == Tool::Edit];
+        let on = [self.tool == Tool::Draw, self.tool == Tool::Brush, false, self.live, self.sym, false, false, self.tool == Tool::Edit];
         let (r0, r1, step) = (44.0f32, 128.0f32, std::f32::consts::FRAC_PI_4);
         let at = |r: f32, a: f32| c + egui::vec2(a.sin(), -a.cos()) * r;
         p.circle_filled(c, r1 + 10.0, egui::Color32::from_rgba_unmultiplied(8, 5, 3, 120));
@@ -912,7 +963,7 @@ impl App {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let t = match self.tool {
                             Tool::Draw => "PENCIL",
-                            Tool::Relax => "RELAX",
+                            Tool::Brush => if self.bk == BrushKind::Relax { "BRUSH · RELAX" } else { "BRUSH · GRAB" },
                             Tool::Edit => "EDIT",
                         };
                         theme::label(ui, t, theme::mono(11.0), theme::LAMP);
@@ -934,8 +985,8 @@ impl App {
                 if rail_item(ui, "Edit", "Tab", theme::Icon::Edit, self.tool == Tool::Edit) {
                     self.tool = if self.tool == Tool::Edit { Tool::Draw } else { Tool::Edit };
                 }
-                if rail_item(ui, "Relax", "R", theme::Icon::Relax, self.tool == Tool::Relax) {
-                    self.tool = if self.tool == Tool::Relax { Tool::Draw } else { Tool::Relax };
+                if rail_item(ui, "Brush", "B / 1", theme::Icon::Relax, self.tool == Tool::Brush) {
+                    self.tool = if self.tool == Tool::Brush { Tool::Draw } else { Tool::Brush };
                 }
                 ui.add_space(6.0);
                 ui.separator();
@@ -972,7 +1023,7 @@ impl App {
             .frame(egui::Frame::new().fill(theme::PANEL).stroke(egui::Stroke::new(1.0, theme::LINE)).inner_margin(egui::Margin::same(12)))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
-                let tabs = [(Tab::Strokes, "Strokes"), (Tab::Grid, "Grid"), (Tab::Auto, "Auto"), (Tab::Mirror, "Mirror"), (Tab::Relax, "Relax"), (Tab::Export, "Export")];
+                let tabs = [(Tab::Strokes, "Strokes"), (Tab::Grid, "Grid"), (Tab::Auto, "Auto"), (Tab::Mirror, "Mirror"), (Tab::Brush, "Brush"), (Tab::Export, "Export")];
                 let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
                 let w = row.width() / tabs.len() as f32;
                 for (k, (tab, name)) in tabs.iter().enumerate() {
@@ -997,7 +1048,7 @@ impl App {
                         Tab::Grid => self.page_grid(ui),
                         Tab::Auto => self.page_auto(ui),
                         Tab::Mirror => self.page_mirror(ui),
-                        Tab::Relax => self.page_relax(ui),
+                        Tab::Brush => self.page_brush(ui),
                         Tab::Export => self.page_export(ui),
                     }
                 });
@@ -1121,16 +1172,22 @@ impl App {
         });
     }
 
-    fn page_relax(&mut self, ui: &mut egui::Ui) {
-        Self::heading(ui, "Relax Brush", "Drag over the low mesh to even out the quads.");
-        let (txt, kind) = if self.tool == Tool::Relax { ("RELAX · ON", theme::Kind::Amber) } else { ("RELAX · OFF", theme::Kind::Ghost) };
-        if theme::button(ui, txt, kind, egui::vec2(ui.available_width(), 44.0)).clicked() {
-            self.tool = if self.tool == Tool::Relax { Tool::Draw } else { Tool::Relax };
-        }
-        ui.add(egui::Slider::new(&mut self.brush_px, 10.0..=250.0).suffix(" px").text("RADIUS"));
-        ui.add(egui::Slider::new(&mut self.brush_strength, 0.05..=1.0).text("STRENGTH"));
-        ui.checkbox(&mut self.pin_border, egui::RichText::new("Keep patch borders in place").font(theme::typew(12.0)));
-        theme::label(ui, "Points slide along the surface toward their neighbours. Live auto is frozen into normal patches when you start brushing. Ctrl+Z undoes a brush stroke.", theme::hand(17.0), theme::INK_SOFT);
+    fn page_brush(&mut self, ui: &mut egui::Ui) {
+        Self::heading(ui, "Brush", "B or 1 toggles it. Drag over the low mesh.");
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 8.0) / 2.0;
+            for (k, name) in [(BrushKind::Relax, "Relax  R"), (BrushKind::Grab, "Grab  V")] {
+                let on = self.tool == Tool::Brush && self.bk == k;
+                if theme::button(ui, name, if on { theme::Kind::Amber } else { theme::Kind::Ghost }, egui::vec2(w, 32.0)).clicked() {
+                    (self.tool, self.bk) = (Tool::Brush, k);
+                }
+            }
+        });
+        ui.add(egui::Slider::new(&mut self.brush_px, 8.0..=300.0).suffix(" px").text("Size  [ ]"));
+        ui.add(egui::Slider::new(&mut self.brush_hard, 0.0..=0.95).text("Hardness"));
+        ui.add_enabled(self.bk == BrushKind::Relax, egui::Slider::new(&mut self.brush_strength, 0.05..=1.0).text("Strength"));
+        ui.checkbox(&mut self.pin_border, "Keep patch borders in place");
+        theme::label(ui, "Ctrl + right-drag: sideways = size, up/down = hardness. Symmetry applies. Live auto freezes into patches when you brush. Ctrl+Z undoes a brush stroke.", theme::hand(17.0), theme::INK_SOFT);
     }
 
     fn page_export(&mut self, ui: &mut egui::Ui) {
@@ -1164,7 +1221,12 @@ impl App {
         let d = resp.drag_delta();
 
         // camera
-        if !busy && (resp.dragged_by(egui::PointerButton::Secondary) || (alt && resp.dragged_by(egui::PointerButton::Primary))) {
+        let ctrl = ui.input(|i| i.modifiers.command);
+        if self.tool == Tool::Brush && ctrl && resp.dragged_by(egui::PointerButton::Secondary) {
+            // Substance-style: Ctrl+RMB drag, sideways = size, up/down = hardness
+            self.brush_px = (self.brush_px + d.x).clamp(8.0, 300.0);
+            self.brush_hard = (self.brush_hard - d.y * 0.004).clamp(0.0, 0.95);
+        } else if !busy && (resp.dragged_by(egui::PointerButton::Secondary) || (alt && resp.dragged_by(egui::PointerButton::Primary))) {
             self.yaw -= d.x * 0.01;
             self.pitch = (self.pitch + d.y * 0.01).clamp(-1.5, 1.5);
         }
@@ -1185,24 +1247,53 @@ impl App {
         }
         let eye = self.eye();
 
-        // relax brush: drag over the low mesh
-        let relaxing = self.tool == Tool::Relax && resp.dragged_by(egui::PointerButton::Primary) && !alt && !busy;
-        if relaxing {
+        // brush (Relax / Grab) over the low mesh; symmetry applies to both
+        let brushing = self.tool == Tool::Brush && resp.dragged_by(egui::PointerButton::Primary) && !alt && !busy;
+        if brushing {
             if self.brush.is_none() {
                 self.begin_brush();
+                self.grab = None;
             }
             if let (Some(m), Some(w), Some(p)) = (&self.mesh, self.brush.as_mut(), resp.interact_pointer_pos()) {
                 if let Some(hit) = ray_hit(m, vp, rect, p) {
-                    let r = self.brush_px * 2.0 * (hit - eye).length() * (fov * 0.5).tan() / rect.height().max(1.0);
-                    if w.relax(m, hit, r, self.brush_strength, self.pin_border) {
+                    let k = 2.0 * (hit - eye).length() * (fov * 0.5).tan() / rect.height().max(1.0); // world units per pixel
+                    let mirror = |q: Vec3| geom::mirror_on_surface(m, q, self.axis, self.plane, diag * 2e-4);
+                    let mut changed = false;
+                    match self.bk {
+                        BrushKind::Relax => {
+                            let centers = if self.sym { vec![hit, mirror(hit)] } else { vec![hit] };
+                            let wt = w.weights(&centers, self.brush_px * k, self.brush_hard, self.pin_border);
+                            changed = w.relax(m, &wt, self.brush_strength);
+                        }
+                        BrushKind::Grab => {
+                            // the grabbed set is fixed when the stroke starts and follows the cursor
+                            let (w1, w2, k0) = self.grab.get_or_insert_with(|| {
+                                let w1 = w.weights(&[hit], self.brush_px * k, self.brush_hard, self.pin_border);
+                                let w2 = if self.sym { w.weights(&[mirror(hit)], self.brush_px * k, self.brush_hard, self.pin_border) } else { vec![] };
+                                (w1, w2, k)
+                            });
+                            let delta = (right * d.x - up * d.y) * *k0;
+                            let mut dm = delta;
+                            dm[self.axis] = -dm[self.axis];
+                            let mut parts: Vec<(&[f32], Vec3)> = vec![(w1.as_slice(), delta)];
+                            if !w2.is_empty() {
+                                parts.push((w2.as_slice(), dm));
+                            }
+                            if d != egui::Vec2::ZERO {
+                                changed = w.grab(m, &parts);
+                            }
+                        }
+                    }
+                    if changed {
                         w.write_back(&mut self.patches);
                         self.patch_rev += 1;
                     }
                 }
             }
-            ui.ctx().request_repaint(); // keep relaxing while the pointer rests
+            ui.ctx().request_repaint(); // keep brushing while the pointer rests
         } else {
             self.brush = None;
+            self.grab = None;
         }
 
         // drawing: freehand, or with Shift a straight line (cheap screen-space preview, raycast on release)
@@ -1288,63 +1379,30 @@ impl App {
             }
         }
 
-        // Edit tool: click toggles a face; press and drag paints every face the cursor passes over
-        let npatch = self.patches.len() + self.live_patches.len();
-        if npatch != self.fsel_n {
-            self.fsel_n = npatch;
+        // Edit tool: press and sweep over faces to select them (Ctrl = deselect); reacts on press, no drag threshold
+        self.ensure_faces();
+        if self.faces.len() != self.fsel_n {
+            self.fsel_n = self.faces.len();
             self.fsel.clear();
         }
-        if self.tool == Tool::Edit && !busy && !alt {
-            let dragging = resp.dragged_by(egui::PointerButton::Primary);
-            let scr = |q: Vec3| {
-                let c = vp * q.extend(1.0);
-                egui::pos2(rect.min.x + (c.x / c.w * 0.5 + 0.5) * rect.width(), rect.min.y + (0.5 - c.y / c.w * 0.5) * rect.height())
-            };
-            let faces = if dragging || resp.clicked_by(egui::PointerButton::Primary) { self.all_faces() } else { vec![] };
-            let visible = |c: Vec3| match &self.mesh {
-                Some(m) if faces.len() < 30000 => {
-                    let d = c - eye;
-                    let l = d.length().max(1e-9);
-                    geom::raycast(m, eye, d / l).map_or(true, |(t, _)| t > l - m.diag * 0.01)
-                }
-                _ => true,
-            };
-            let mut picked: Option<Vec<(u32, u32)>> = None;
-            if dragging || resp.clicked_by(egui::PointerButton::Primary) {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let inside = |q: [egui::Pos2; 4]| {
-                        let tri = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
-                            let s = |p1: egui::Pos2, p2: egui::Pos2, p3: egui::Pos2| (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
-                            let (d1, d2, d3) = (s(p, a, b), s(p, b, c), s(p, c, a));
-                            !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
-                        };
-                        tri(q[0], q[1], q[2]) || tri(q[0], q[2], q[3])
-                    };
-                    let mut hits: Vec<(f32, (u32, u32))> = faces
-                        .iter()
-                        .filter(|(_, c)| inside([scr(c[0]), scr(c[1]), scr(c[2]), scr(c[3])]))
-                        .map(|(k, c)| (((c[0] + c[1] + c[2] + c[3]) * 0.25 - eye).length(), *k))
-                        .collect();
-                    hits.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    let top = hits.into_iter().find(|(_, k)| faces.iter().find(|f| f.0 == *k).map_or(false, |f| visible((f.1[0] + f.1[1] + f.1[2] + f.1[3]) * 0.25)));
-                    picked = Some(top.map(|(_, k)| vec![k]).unwrap_or_default());
-                }
-            }
-            if let Some(ks) = picked {
-                if ks.is_empty() && !dragging {
-                    self.fsel.clear(); // click on nothing
-                }
-                for k in ks {
-                    match self.fsel.iter().position(|x| *x == k) {
-                        Some(i) if !dragging => {
-                            self.fsel.remove(i); // click again to deselect
+        if self.tool == Tool::Edit && !busy && !alt && resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down()) {
+            let erase = ui.input(|i| i.modifiers.command);
+            match resp.interact_pointer_pos().and_then(|p| self.pick_face(vp, rect, p, eye)) {
+                Some(i) => {
+                    let ids = if self.sym { [Some(i), self.mirror_face(i)] } else { [Some(i), None] };
+                    for k in ids.into_iter().flatten() {
+                        if erase {
+                            self.fsel.remove(&k);
+                        } else {
+                            self.fsel.insert(k);
                         }
-                        Some(_) => {}
-                        None => self.fsel.push(k),
                     }
+                    self.status = format!("{} faces selected", self.fsel.len());
                 }
-                self.status = format!("{} faces selected", self.fsel.len());
+                None if ui.input(|i| i.pointer.primary_pressed()) && !erase => self.fsel.clear(), // pressed on nothing
+                None => {}
             }
+            ui.ctx().request_repaint();
         }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.fsel.clear();
@@ -1360,6 +1418,13 @@ impl App {
         };
         let mut dsegs: Vec<Seg> = self.cur.windows(2).map(|w| Seg::new(w[0], w[1], [1.0, 0.45, 0.0], 2.2)).collect();
         dsegs.extend(self.cur_m.windows(2).map(|w| Seg::new(w[0], w[1], [1.0, 0.6, 0.2], 2.2)));
+        let gold = [1.0, 0.82, 0.25];
+        let ssegs: Vec<Seg> = self
+            .fsel
+            .iter()
+            .filter_map(|&i| self.faces.get(i))
+            .flat_map(|c| (0..4).map(move |k| Seg::new(c[k], c[(k + 1) % 4], gold, 3.6)).chain([Seg::new(c[0], c[2], gold, 1.4), Seg::new(c[1], c[3], gold, 1.4)]))
+            .collect();
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             Frame {
@@ -1368,6 +1433,7 @@ impl App {
                 upload: self.upload.take(),
                 geo,
                 dsegs,
+                ssegs,
                 low: [self.low[0], self.low[1], self.low[2], self.low_a],
                 eye: [eye.x, eye.y, eye.z, diag * self.low_lift * 1e-3],
                 res: [rect.width(), rect.height()],
@@ -1379,10 +1445,10 @@ impl App {
         if let Some((a, b)) = self.line {
             p.line_segment([a, b], egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 115, 0)));
         }
-        if self.tool == Tool::Relax && !busy {
+        if self.tool == Tool::Brush && !busy {
             if let Some(h) = resp.hover_pos().or(resp.interact_pointer_pos()) {
                 p.circle_stroke(h, self.brush_px, egui::Stroke::new(1.5, theme::LAMP));
-                p.circle_stroke(h, self.brush_px * (1.0 - self.brush_strength), egui::Stroke::new(1.0, theme::LAMP.gamma_multiply(0.45)));
+                p.circle_stroke(h, self.brush_px * self.brush_hard, egui::Stroke::new(1.0, theme::LAMP.gamma_multiply(0.45)));
             }
         }
         let chip = |pos: egui::Pos2, align: egui::Align2, t: &str, col: egui::Color32| {
@@ -1401,8 +1467,8 @@ impl App {
             if self.tool == Tool::Edit {
                 chip(rect.center_top() + egui::vec2(0.0, 16.0), egui::Align2::CENTER_TOP, &format!("EDIT · {} FACES", self.fsel.len()), theme::LAMP);
             }
-            if self.tool == Tool::Relax {
-                chip(rect.center_top() + egui::vec2(0.0, 16.0), egui::Align2::CENTER_TOP, "RELAX BRUSH", theme::LAMP);
+            if self.tool == Tool::Brush {
+                chip(rect.center_top() + egui::vec2(0.0, 16.0), egui::Align2::CENTER_TOP, if self.bk == BrushKind::Relax { "BRUSH · RELAX" } else { "BRUSH · GRAB" }, theme::LAMP);
             }
             if self.sym {
                 chip(rect.right_top() + egui::vec2(-16.0, 16.0), egui::Align2::RIGHT_TOP, &format!("MIRROR · {} = {:.2}", ["X", "Y", "Z"][self.axis], self.plane), egui::Color32::from_rgb(0x8f, 0xb0, 0xff));
@@ -1415,7 +1481,7 @@ impl App {
         p.text(
             rect.left_bottom() + egui::vec2(16.0, -14.0),
             egui::Align2::LEFT_CENTER,
-            "drag draw · Shift line · Space radial · Tab edit faces · R relax · RMB/Alt+drag orbit · MMB pan · wheel zoom · Ctrl+Z",
+            "drag draw · Shift line · Space radial · Tab edit faces · B brush (R relax, V grab) · RMB/Alt+drag orbit · MMB pan · wheel zoom · Ctrl+Z",
             theme::mono(10.0),
             theme::MUTED,
         );

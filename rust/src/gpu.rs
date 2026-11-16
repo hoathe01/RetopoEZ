@@ -65,6 +65,7 @@ pub struct Gpu {
     segs: VBuf,
     psegs: VBuf,
     dsegs: VBuf, // the stroke being drawn: rebuilt every frame, tiny
+    ssegs: VBuf, // selected faces (lifted like the low-poly edges): rebuilt every frame while any are selected
 }
 
 impl Gpu {
@@ -139,6 +140,7 @@ impl Gpu {
             segs: None,
             psegs: None,
             dsegs: None,
+            ssegs: None,
         }
     }
 }
@@ -156,6 +158,7 @@ pub struct Frame {
     pub upload: Option<Arc<(Vec<Vertex>, Vec<u32>)>>,
     pub geo: Option<Arc<Geo>>, // Some only when the geometry changed
     pub dsegs: Vec<Seg>,
+    pub ssegs: Vec<Seg>,
     pub low: [f32; 4],
     pub eye: [f32; 4],
     pub res: [f32; 2],
@@ -182,6 +185,7 @@ impl egui_wgpu::CallbackTrait for Frame {
             g.psegs = buf(device, "psegs", &geo.psegs);
         }
         g.dsegs = buf(device, "dsegs", &self.dsegs);
+        g.ssegs = buf(device, "ssegs", &self.ssegs);
         Vec::new()
     }
 
@@ -199,8 +203,8 @@ impl egui_wgpu::CallbackTrait for Frame {
             pass.set_vertex_buffer(0, fb.slice(..));
             pass.draw(0..*n, 0..1);
         }
-        if let Some((b, n)) = &g.psegs {
-            pass.set_pipeline(&g.seg_low_pipe);
+        pass.set_pipeline(&g.seg_low_pipe);
+        for (b, n) in [&g.psegs, &g.ssegs].into_iter().flatten() {
             pass.set_vertex_buffer(0, b.slice(..));
             pass.draw(0..6, 0..*n);
         }

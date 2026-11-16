@@ -1254,24 +1254,52 @@ impl Weld {
         Weld { verts, nrm, ids, nbr, border }
     }
 
-    /// One relax pass around `center`: vertices slide toward the mean of their neighbours (tangentially),
-    /// weighted by a smooth falloff, and are put back on the surface. Returns whether anything moved.
-    pub fn relax(&mut self, m: &Mesh, center: Vec3, radius: f32, strength: f32, pin_border: bool) -> bool {
+    /// Brush weight per welded vertex: 1 inside `hardness * radius`, smooth falloff to 0 at `radius`.
+    /// Several centres (symmetry) combine with max; pinned border vertices get 0.
+    pub fn weights(&self, centers: &[Vec3], radius: f32, hardness: f32, pin_border: bool) -> Vec<f32> {
+        (0..self.verts.len())
+            .map(|v| {
+                if self.nbr[v].is_empty() || (pin_border && self.border[v]) {
+                    return 0.0;
+                }
+                let d = centers.iter().map(|c| self.verts[v].distance(*c)).fold(f32::MAX, f32::min) / radius;
+                let f = 1.0 - ((d - hardness) / (1.0 - hardness).max(1e-3)).clamp(0.0, 1.0);
+                f * f * (3.0 - 2.0 * f)
+            })
+            .collect()
+    }
+
+    /// Relax: vertices slide toward the mean of their neighbours (tangentially), scaled by `w * strength`,
+    /// and are put back on the surface. Returns whether anything moved.
+    pub fn relax(&mut self, m: &Mesh, w: &[f32], strength: f32) -> bool {
         let src = self.verts.clone(); // Jacobi: every vertex reads the old positions
         let mut moved = false;
         for v in 0..src.len() {
-            let d = src[v].distance(center);
-            if d >= radius || self.nbr[v].is_empty() || (pin_border && self.border[v]) {
+            if w[v] <= 0.0 {
                 continue;
             }
-            let f = 1.0 - d / radius;
             let avg = self.nbr[v].iter().map(|&k| src[k as usize]).sum::<Vec3>() / self.nbr[v].len() as f32;
             let mut delta = avg - src[v];
             delta -= self.nrm[v] * delta.dot(self.nrm[v]); // no shrinking along the normal
-            let (q, nn) = closest(m, src[v] + delta * (f * f * strength));
+            let (q, nn) = closest(m, src[v] + delta * (w[v] * strength));
             self.verts[v] = q;
             self.nrm[v] = nn;
             moved = true;
+        }
+        moved
+    }
+
+    /// Grab: drag the weighted vertices by `delta` (one weight set per symmetry side) and re-snap them.
+    pub fn grab(&mut self, m: &Mesh, parts: &[(&[f32], Vec3)]) -> bool {
+        let mut moved = false;
+        for v in 0..self.verts.len() {
+            let d: Vec3 = parts.iter().map(|(w, d)| *d * w[v]).sum();
+            if d != Vec3::ZERO {
+                let (q, nn) = closest(m, self.verts[v] + d);
+                self.verts[v] = q;
+                self.nrm[v] = nn;
+                moved = true;
+            }
         }
         moved
     }
@@ -1313,7 +1341,8 @@ mod brush_tests {
         let mut w = Weld::build(&ps, 1e-3);
         assert_eq!(w.verts.len(), 15); // 18 grid points, 3 shared on the seam
         for _ in 0..30 {
-            w.relax(&m, Vec3::new(-1., 1., 0.), 3.0, 0.8, true);
+            let wt = w.weights(&[Vec3::new(-1., 1., 0.)], 3.0, 0.0, true);
+            w.relax(&m, &wt, 0.8);
         }
         w.write_back(&mut ps);
         assert!(ps[0].pts[4].distance(Vec3::new(-1., 1., 0.)) < 0.01, "{}", ps[0].pts[4]);
@@ -1322,14 +1351,28 @@ mod brush_tests {
     }
 
     #[test]
+    fn grab_moves_weighted_vertices_and_weights_fall_off() {
+        let m = flat();
+        let mut w = Weld::build(&patches(Vec3::new(-1., 1., 0.)), 1e-3);
+        let wt = w.weights(&[Vec3::new(-1., 1., 0.)], 1.2, 0.5, false);
+        assert!(wt.iter().cloned().fold(0.0, f32::max) > 0.99 && wt.iter().any(|&x| x == 0.0));
+        let before = w.verts.clone();
+        assert!(w.grab(&m, &[(&wt, Vec3::new(0.2, 0., 0.))]));
+        let k = (0..wt.len()).find(|&v| wt[v] > 0.99).unwrap();
+        assert!((w.verts[k].x - before[k].x - 0.2).abs() < 1e-4);
+    }
+
+    #[test]
     fn rim_vertices_move_only_when_unpinned() {
         let m = flat();
         let mut w = Weld::build(&patches(Vec3::new(-1., 1., 0.)), 1e-3);
         let before = w.verts.clone();
-        w.relax(&m, Vec3::new(0., 1., 0.), 5.0, 1.0, true);
+        let wt = w.weights(&[Vec3::new(0., 1., 0.)], 5.0, 0.0, true);
+        w.relax(&m, &wt, 1.0);
         let rim_moved = (0..w.verts.len()).any(|v| w.border[v] && w.verts[v] != before[v]);
         assert!(!rim_moved);
-        w.relax(&m, Vec3::new(0., 1., 0.), 5.0, 1.0, false);
+        let wt = w.weights(&[Vec3::new(0., 1., 0.)], 5.0, 0.0, false);
+        w.relax(&m, &wt, 1.0);
         assert!((0..w.verts.len()).any(|v| w.border[v] && w.verts[v] != before[v]));
     }
 }
