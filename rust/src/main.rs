@@ -12,6 +12,7 @@ use glam::{Mat4, Vec3};
 use std::{fs, hash::{Hash, Hasher}, net::TcpListener, path::PathBuf, sync::{atomic::{AtomicBool, Ordering}, Arc}, time::Duration};
 
 static FOCUS: AtomicBool = AtomicBool::new(false);
+static OPEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None); // file a second launch asked us to open
 const LOCK_ADDR: &str = "127.0.0.1:47831"; // bound = a viewer is already running
 
 // ------------------------------------------------------------------ App
@@ -96,6 +97,14 @@ struct App {
     dist: f32,
 }
 
+/// Where the viewer remembers the last opened file.
+fn config_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|p| PathBuf::from(p).join("RetopoEZ"))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/retopoez")))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 fn exchange_dir() -> PathBuf {
     std::env::temp_dir().join("retopoez") // same folder retopoez.py uses in Maya
 }
@@ -136,7 +145,14 @@ impl App {
         // a later launch pings this socket: bring the window to front instead of opening another
         let ctx = cc.egui_ctx.clone();
         std::thread::spawn(move || {
-            for _ in lock.incoming() {
+            for stream in lock.incoming().flatten() {
+                // a second launch may send the file it was asked to open (Open with / drag onto the exe)
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut line);
+                if !line.trim().is_empty() {
+                    *OPEN.lock().unwrap() = Some(line.trim().to_string());
+                }
                 FOCUS.store(true, Ordering::Relaxed);
                 ctx.request_repaint();
             }
@@ -144,7 +160,11 @@ impl App {
         theme::install(&cc.egui_ctx);
         let rs = cc.wgpu_render_state.as_ref().expect("wgpu backend required");
         rs.renderer.write().callback_resources.insert(Gpu::new(rs));
-        let path = std::env::args().nth(1).unwrap_or_else(|| exchange_dir().join("mesh.obj").to_string_lossy().into());
+        // file given on the command line, else the one used last time, else the Maya exchange file
+        let path = std::env::args()
+            .nth(1)
+            .or_else(|| fs::read_to_string(config_dir().join("last.txt")).ok().map(|s| s.trim().to_string()).filter(|s| PathBuf::from(s).is_file()))
+            .unwrap_or_else(|| exchange_dir().join("mesh.obj").to_string_lossy().into());
         let mut a = App {
             path,
             status: String::new(),
@@ -200,6 +220,11 @@ impl App {
         };
         a.load();
         a
+    }
+
+    fn open_path(&mut self, p: String) {
+        self.path = p;
+        self.load();
     }
 
     fn session_path(&self) -> Option<PathBuf> {
@@ -284,6 +309,10 @@ impl App {
         match geom::load_obj(&p) {
             Ok(m) => {
                 let sig = (m.pos.len() as u32, m.diag.to_bits());
+                if self.path != exchange_dir().join("mesh.obj").to_string_lossy() {
+                    let _ = fs::create_dir_all(config_dir());
+                    let _ = fs::write(config_dir().join("last.txt"), &self.path);
+                }
                 self.upload = Some(Arc::new((gpu::gpu_vertices(&m), m.idx.clone())));
                 if self.sig == Some(sig) {
                     self.mesh = Some(m); // Maya re-exported the same mesh: keep the work
@@ -464,7 +493,10 @@ impl App {
 
     fn export(&mut self) {
         let Some(m) = &self.mesh else { return };
-        let out = PathBuf::from(&self.path).with_file_name("retopo.obj");
+        // Maya's exchange file keeps its fixed name; any other mesh gets <name>_retopo.obj beside it
+        let src = PathBuf::from(&self.path);
+        let stem = src.file_stem().map_or(String::new(), |s| s.to_string_lossy().into_owned());
+        let out = src.with_file_name(if stem == "mesh" { "retopo.obj".to_string() } else { format!("{stem}_retopo.obj") });
         let obj = geom::to_obj(self.patches.iter().chain(&self.live_patches), m.diag * self.weld * 1e-3);
         self.status = match fs::write(&out, obj) {
             Ok(_) => format!("exported {} patches -> {}", self.patches.len() + self.live_patches.len(), out.display()),
@@ -505,7 +537,17 @@ impl eframe::App for App {
         if FOCUS.swap(false, Ordering::Relaxed) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
         }
-        // Maya re-exports the mesh -> reload when the file changes
+        // a file dropped on the window, or handed over by a second launch
+        let dropped = ui.input(|i| i.raw.dropped_files.iter().next().map(|f| f.path().to_path_buf()));
+        let asked = OPEN.lock().unwrap().take();
+        if let Some(p) = dropped.map(|p| p.to_string_lossy().into_owned()).or(asked) {
+            if p.to_lowercase().ends_with(".obj") {
+                self.open_path(p);
+            } else {
+                self.status = "only .obj files can be opened".into();
+            }
+        }
+        // the file changes on disk (e.g. Maya re-exported it) -> reload
         ui.ctx().request_repaint_after(Duration::from_millis(1000));
         let now = fs::metadata(&self.path).and_then(|m| m.modified()).ok();
         if now.is_some() && now != self.mtime {
@@ -806,7 +848,7 @@ impl App {
                             self.book = !self.book;
                         }
                         let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                        let (col, txt) = if self.mesh.is_some() { (theme::GREEN, "MAYA LINKED") } else { (theme::LAMP, "WAITING FOR MAYA") };
+                        let (col, txt) = if self.mesh.is_some() { (theme::GREEN, "MESH LOADED") } else { (theme::LAMP, "NO MESH") };
                         ui.painter().circle_filled(r.center(), 4.0, col);
                         theme::label(ui, txt, theme::typew(11.0), egui::Color32::from_rgb(0xc4, 0xb2, 0x94));
                     });
@@ -822,7 +864,7 @@ impl App {
                     theme::label(ui, "›", theme::typew(13.0), theme::LAMP);
                     theme::label(ui, self.status.to_uppercase(), theme::typew(11.0), egui::Color32::from_rgb(0xc4, 0xb2, 0x94));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let t = if self.patches.is_empty() && self.live_patches.is_empty() { "draw strokes, then grid or auto patch" } else { "press E, then Import retopo mesh in Maya" };
+                        let t = if self.patches.is_empty() && self.live_patches.is_empty() { "draw strokes, then grid or auto patch" } else { "press E: saves <name>_retopo.obj beside the mesh" };
                         theme::label(ui, t, theme::typew(11.0), theme::MUTED);
                     });
                 });
@@ -1069,7 +1111,7 @@ impl App {
         if theme::button(ui, "UNDO PATCH", theme::Kind::Ghost, egui::vec2(ui.available_width(), 34.0)).clicked() {
             self.undo_patch();
         }
-        theme::label(ui, "Then press Import retopo mesh in Maya.", theme::hand(17.0), theme::INK_SOFT);
+        theme::label(ui, "Saved next to the mesh as <name>_retopo.obj (Maya: Import retopo mesh).", theme::hand(17.0), theme::INK_SOFT);
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
@@ -1255,7 +1297,7 @@ impl App {
         } else {
             let c = rect.center();
             p.text(c - egui::vec2(0.0, 20.0), egui::Align2::CENTER_CENTER, "NO CASE LOADED", theme::serif(30.0), theme::TITLE);
-            p.text(c + egui::vec2(0.0, 16.0), egui::Align2::CENTER_CENTER, "In Maya, select the high-poly mesh and press Open viewer.", theme::typew(13.0), theme::MUTED);
+            p.text(c + egui::vec2(0.0, 16.0), egui::Align2::CENTER_CENTER, "Drop an .obj file here, or use Open with on one. (From Maya: Open viewer.)", theme::typew(13.0), theme::MUTED);
         }
         p.text(
             rect.left_bottom() + egui::vec2(16.0, -14.0),
@@ -1269,7 +1311,13 @@ impl App {
 
 fn main() -> eframe::Result {
     let Ok(lock) = TcpListener::bind(LOCK_ADDR) else {
-        let _ = std::net::TcpStream::connect(LOCK_ADDR); // wake the running one, then quit
+        // wake the running one (and hand it the file we were asked to open), then quit
+        if let Ok(mut s) = std::net::TcpStream::connect(LOCK_ADDR) {
+            if let Some(a) = std::env::args().nth(1) {
+                let abs = std::path::absolute(&a).unwrap_or_else(|_| PathBuf::from(a));
+                let _ = std::io::Write::write_all(&mut s, format!("{}\n", abs.display()).as_bytes());
+            }
+        }
         return Ok(());
     };
     let opts = eframe::NativeOptions {

@@ -13,6 +13,7 @@ Viewer Rust + wgpu (eframe/egui) vẽ stroke lên mesh high-poly, sinh lưới q
 - Relax brush (phím R): kéo trên low mesh để làm đều ô lưới, trượt theo bề mặt, giữ nguyên viền patch; Ctrl+Z hoàn tác từng nét.
 - Menu tròn: giữ Tab, rê tới ô muốn chọn rồi thả (Draw, Relax, Grid, Live, Mirror, Export, Undo, Delete).
 - Vẽ line bằng GPU (độ dày cố định theo pixel) và cache buffer: mỗi khung hình chỉ cập nhật uniform, chỉ dựng lại khi nét hoặc patch đổi.
+- Chạy độc lập không cần Maya: kéo thả .obj, Open with, tự mở lại file lần trước, export `<tên>_retopo.obj`.
 - Tự lưu phiên làm việc cạnh `mesh.obj`; Maya export lại cùng mesh không mất việc.
 - BVH cho raycast và closest point (hàng triệu tam giác vẫn mượt).
 - Một cửa sổ viewer duy nhất; lần đầu chạy từ Maya tự tải viewer từ GitHub Releases.

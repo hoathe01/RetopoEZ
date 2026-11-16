@@ -48,3 +48,12 @@ cargo test
 - Phím: G grid, A auto, M mirror, E export, P ẩn/hiện sổ, Ctrl+Z, Del.
 
 Font nhúng: Cinzel, Caveat, Oswald, IBM Plex Mono (SIL OFL), Special Elite (Apache 2.0), giấy phép trong `rust/assets/`.
+
+## Chạy độc lập, không cần Maya
+
+Viewer là một file exe riêng. Mở bằng cách:
+- kéo thả file `.obj` vào cửa sổ viewer;
+- hoặc chuột phải file `.obj` → Open with → `retopoez.exe`, hoặc kéo file lên exe (viewer đang mở thì nó nhận file và hiện lên, không mở cửa sổ thứ hai);
+- hoặc `retopoez.exe đường\dẫn\mesh.obj`.
+
+Lần sau mở viewer không kèm file, nó mở lại file lần trước. Export (phím E) lưu `<tên>_retopo.obj` cạnh file gốc; import vào Maya hay phần mềm khác bằng File → Import. Cầu nối Maya (`retopoez.py`) vẫn dùng được nhưng không bắt buộc.
